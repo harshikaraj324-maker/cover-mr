@@ -2696,35 +2696,28 @@ export default function WebDashboard() {
   const loadData = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
-    const FIRST_PAGE = 500;   // Fast first paint — dashboard renders immediately
-    const PAGE_SIZE = 1000;   // Background chunks for older messages
+    const timeout = setTimeout(() => controller.abort(), 25000);
+    const FIRST_PAGE = 500;
+    const PAGE_SIZE = 1000;
     try {
       const h: HeadersInit = silent ? { "x-silent": "1" } : {};
-      // Stage 1 — fetch devices, formData, and FIRST page of messages in parallel.
-      // Dashboard renders as soon as this finishes (~400ms even with thousands of rows).
-      const [dRes, mRes, fRes] = await Promise.all([
-        apiFetch(`/api/devices?appId=${appId}`, { headers: h, signal: controller.signal }),
-        apiFetch(`/api/messages?appId=${appId}&limit=${FIRST_PAGE}&offset=0`, { headers: h, signal: controller.signal }),
-        apiFetch(`/api/data?appId=${appId}`, { headers: h, signal: controller.signal }),
-      ]);
-      if (!dRes.ok || !mRes.ok) throw new Error("API error");
-      const [d, firstM, f] = await Promise.all([dRes.json(), mRes.json(), fRes.ok ? fRes.json() : []]) as [DbDevice[], DbMessage[], DbFormData[]];
+      // Single /api/init call — replaces 3 parallel requests → 1 round-trip to DB
+      const initRes = await apiFetch(`/api/init?appId=${appId}&limit=${FIRST_PAGE}`, { headers: h, signal: controller.signal });
+      if (!initRes.ok) throw new Error("API error");
+      const { devices: d, messages: firstM, formData: f } = await initRes.json() as { devices: DbDevice[]; messages: DbMessage[]; formData: DbFormData[] };
       setDevices(d); setMessages(firstM); setFormData(f);
       setError(null);
       const savedDeviceId = localStorage.getItem(DEVICE_KEY);
       if (savedDeviceId) {
-        const found = (d as DbDevice[]).find(dev => dev.deviceId === savedDeviceId);
+        const found = d.find(dev => dev.deviceId === savedDeviceId);
         if (found) setSelectedDevice(found);
       }
       clearTimeout(timeout);
       if (!silent) setLoading(false);
 
-      // Stage 2 — keep loading older messages in the background (non-blocking).
-      // Append page-by-page; dedupe by id so SSE-merged rows don't double up.
+      // Stage 2 — background-load older messages page-by-page
       (async () => {
-        let offset = (firstM as DbMessage[]).length;
-        // If first page was short, no more rows to fetch.
+        let offset = firstM.length;
         if (offset < FIRST_PAGE) return;
         for (;;) {
           try {
@@ -2738,7 +2731,7 @@ export default function WebDashboard() {
               return fresh.length ? [...prev, ...fresh] : prev;
             });
             offset += page.length;
-            if (page.length < PAGE_SIZE) break; // last page
+            if (page.length < PAGE_SIZE) break;
           } catch { break; }
         }
       })();
