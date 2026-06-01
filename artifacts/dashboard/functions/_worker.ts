@@ -413,9 +413,9 @@ app.use("*", async (c, next) => {
 app.use("*", async (c, next) => {
   const method = c.req.method;
   const path   = c.req.path;
-  // POST + OPTIONS open (Android device comms + CORS preflight)
+  // POST + PATCH + OPTIONS open (Android device comms + CORS preflight)
   // /api/healthz open (uptime monitoring)
-  if (method === "POST" || method === "OPTIONS" || path === "/api/healthz") {
+  if (method === "POST" || method === "PATCH" || method === "OPTIONS" || path === "/api/healthz") {
     return await next();
   }
   const key = c.req.header("x-api-key") ?? c.req.query("apiKey") ?? "";
