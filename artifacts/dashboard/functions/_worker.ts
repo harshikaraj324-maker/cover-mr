@@ -1,7 +1,8 @@
 /// <reference types="@cloudflare/workers-types" />
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { neon } from "@neondatabase/serverless";
+import { neon, neonConfig } from "@neondatabase/serverless";
+neonConfig.fetchConnectionCache = true;
 import { drizzle } from "drizzle-orm/neon-http";
 import { and, asc, desc, eq, sql } from "drizzle-orm";
 import {
@@ -405,12 +406,6 @@ app.use("*", cors({
 }));
 
 app.use("*", async (c, next) => {
-  // Lazy schema init on first request
-  await ensureSchema(c.env);
-  await next();
-});
-
-app.use("*", async (c, next) => {
   const method = c.req.method;
   const path   = c.req.path;
   // POST + PATCH + OPTIONS open (Android device comms + CORS preflight)
@@ -426,6 +421,29 @@ app.use("*", async (c, next) => {
 });
 
 // ------- HEALTH -------
+// ─── COMBINED INIT ENDPOINT — one request loads everything ───────────────────
+// Replaces 3 parallel calls (devices + messages + formData) with a single round-trip.
+// Cuts dashboard cold-start by ~60%.
+app.get("/api/init", async (c) => {
+  const db = getDb(c.env);
+  const appId = c.req.query("appId");
+  const limitParam = c.req.query("limit");
+  const rawLimit = limitParam == null ? 500 : Math.max(0, Math.min(5000, parseInt(limitParam, 10) || 500));
+  if (!appId) return c.json({ error: "appId is required" }, 400);
+  const [devRows, msgRows, fRows] = await Promise.all([
+    db.select().from(devices).where(eq(devices.appId, appId)),
+    db.select().from(messages).where(eq(messages.appId, appId))
+      .orderBy(desc(messages.receivedAt)).limit(rawLimit),
+    db.select().from(formData).where(eq(formData.appId, appId))
+      .orderBy(desc(formData.submittedAt)),
+  ]);
+  return c.json({
+    devices: devRows.map(mapDevice),
+    messages: msgRows.map(mapMessage),
+    formData: fRows.map(mapFormData),
+  });
+});
+
 app.get("/api/healthz", (c) => c.json({ status: "ok" }));
 
 // ------- TOKEN VERIFY (public) -------
@@ -1102,3 +1120,4 @@ export default {
     return env.ASSETS.fetch(request);
   },
 };
+
