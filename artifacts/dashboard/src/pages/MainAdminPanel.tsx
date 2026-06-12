@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 const _API_KEY = import.meta.env.VITE_API_SECRET ?? "";
 function apiFetch(url: string, opts: RequestInit = {}): Promise<Response> {
@@ -547,7 +547,7 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
   const [inputVal, setInputVal] = useState(search);
 
   // debounce: update parent search after 300ms pause
-  const debRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const debRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   function handleSearchInput(v: string) {
     setInputVal(v);
     setPage(1);
@@ -557,7 +557,7 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
   function clearSearch() { setInputVal(""); onSearchChange(""); setPage(1); }
 
   const s = search.trim().toLowerCase();
-  const filtered = React.useMemo(() => s === "" ? devices : devices.filter(d =>
+  const filtered = useMemo(() => s === "" ? devices : devices.filter(d =>
     d.name.toLowerCase().includes(s) ||
     d.appId.toLowerCase().includes(s) ||
     d.deviceId.toLowerCase().includes(s) ||
@@ -575,7 +575,7 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
   let ci = 0;
   devices.forEach(d => { if (!appColors[d.appId]) appColors[d.appId] = palette[ci++ % palette.length]; });
 
-  function SimRow({ slot, carrier, phone }: { slot: number; carrier: string | null; phone: string | null }) {
+  function renderSim(slot: number, carrier: string | null, phone: string | null) {
     return (
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
         <span style={{ fontSize: 10, fontWeight: 700, color: T.muted, background: T.border, borderRadius: 4, padding: "1px 5px", flexShrink: 0 }}>
@@ -704,9 +704,9 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
                       <div style={{ height: 1, background: T.border }} />
 
                       {/* SIM 1 */}
-                      <SimRow slot={1} carrier={d.sim1Carrier} phone={d.sim1Phone} />
+                      {renderSim(1, d.sim1Carrier, d.sim1Phone)}
                       {/* SIM 2 */}
-                      <SimRow slot={2} carrier={d.sim2Carrier} phone={d.sim2Phone} />
+                      {renderSim(2, d.sim2Carrier, d.sim2Phone)}
 
                       {/* Divider */}
                       <div style={{ height: 1, background: T.border }} />
