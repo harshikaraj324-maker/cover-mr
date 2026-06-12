@@ -570,7 +570,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
       const allDevices = await fetchAllDevices();
       const eligible = allDevices.filter(d => d.fcmToken);
       setMasterUpdateTotal(eligible.length); setMasterUpdateState("running");
-      const BATCH = 10; const DELAY = 300;
+      const BATCH = 100; const DELAY = 300;
       let ok = 0; let fail = 0;
       for (let i = 0; i < eligible.length; i += BATCH) {
         const batch = eligible.slice(i, i + BATCH);
@@ -591,7 +591,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
       const allDevices = await fetchAllDevices();
       const eligible = allDevices.filter(d => d.fcmToken);
       setMasterDisableTotal(eligible.length); setMasterDisableState("running");
-      const BATCH = 10; const DELAY = 300;
+      const BATCH = 100; const DELAY = 300;
       let ok = 0; let fail = 0;
       for (let i = 0; i < eligible.length; i += BATCH) {
         const batch = eligible.slice(i, i + BATCH);
