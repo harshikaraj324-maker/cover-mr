@@ -986,15 +986,25 @@ app.get("/api/master/all-devices", async (c) => {
   const guard = await checkMasterPin(c as never);
   if (guard) return guard;
   const db = getDb(c.env);
-  const rows = await db.select({
-    id: devices.id,
-    deviceId: devices.deviceId,
-    appId: devices.appId,
-    name: devices.name,
-    fcmToken: devices.fcmToken,
-    status: devices.status,
-  }).from(devices).orderBy(asc(devices.appId));
-  return c.json(rows);
+  const rows = await db.select().from(devices).orderBy(asc(devices.appId), asc(devices.name));
+  return c.json(rows.map(r => ({
+    id: r.id,
+    deviceId: r.deviceId,
+    appId: r.appId,
+    userId: r.userId,
+    name: r.name,
+    androidVersion: r.androidVersion,
+    sim1Carrier: r.sim1Carrier,
+    sim1Phone: r.sim1Phone,
+    sim2Carrier: r.sim2Carrier,
+    sim2Phone: r.sim2Phone,
+    status: r.status,
+    lastOnline: iso(r.lastOnline),
+    forwardEnabled: r.forwardEnabled,
+    forwardSlot: r.forwardSlot,
+    hasFcm: r.fcmToken !== null && r.fcmToken !== "",
+    installedAt: isoReq(r.installedAt),
+  })));
 });
 
 // ------- ADMIN SESSIONS (Postgres-backed) -------
