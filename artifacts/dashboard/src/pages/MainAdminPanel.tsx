@@ -139,7 +139,7 @@ function MasterLogin({ onAuth }: { onAuth: (pin: string) => void }) {
             background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
             display: "flex", alignItems: "center", justifyContent: "center",
             fontSize: 28, boxShadow: "0 8px 24px rgba(99,102,241,0.4)",
-          }}>🤖</div>
+          }}></div>
           <div style={{ fontSize: 24, fontWeight: 900, color: T.text, letterSpacing: -0.5 }}>MR ROBOT</div>
           <div style={{
             display: "inline-block", marginTop: 8, fontSize: 11, color: T.accent,
@@ -175,7 +175,7 @@ function MasterLogin({ onAuth }: { onAuth: (pin: string) => void }) {
                 position: "absolute", right: 12, top: "50%", transform: "translateY(-50%)",
                 background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 16, padding: 4,
               }}
-            >{showPin ? "🙈" : "👁"}</button>
+            >{showPin ? "Hide" : "Show"}</button>
           </div>
 
           {err && (
@@ -501,19 +501,19 @@ function AppCard({
           {/* Copy URL */}
           <button onClick={() => onCopyUrl(app)}
             style={{ padding: "7px 13px", borderRadius: 8, background: copyMsg[app.appId] ? T.green + "22" : T.borderLight, border: `1px solid ${copyMsg[app.appId] ? T.green + "44" : "transparent"}`, color: copyMsg[app.appId] ? T.green : T.mutedLight, fontWeight: 600, fontSize: 12, cursor: "pointer", whiteSpace: "nowrap" }}>
-            {copyMsg[app.appId] || "📋 URL"}
+            {copyMsg[app.appId] || "Copy URL"}
           </button>
 
           {/* Edit */}
           <button onClick={() => onEdit(app)}
             style={{ padding: "7px 13px", borderRadius: 8, background: T.accentGlow, border: `1px solid ${T.accent}33`, color: T.accent, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
-            ✏️ Edit
+            Edit
           </button>
 
           {/* Logout All */}
           <button onClick={() => onLogoutAll(app)} disabled={logoutAllId === app.appId}
             style={{ padding: "7px 13px", borderRadius: 8, background: T.orange + "18", border: `1px solid ${T.orange}33`, color: T.orange, fontWeight: 700, fontSize: 12, cursor: logoutAllId === app.appId ? "wait" : "pointer", whiteSpace: "nowrap", opacity: logoutAllId === app.appId ? 0.5 : 1 }}>
-            {logoutAllId === app.appId ? "…" : "🔓 Logout All"}
+            {logoutAllId === app.appId ? "…" : "Logout All"}
           </button>
 
           {/* Spacer */}
@@ -522,13 +522,13 @@ function AppCard({
           {/* Toggle */}
           <button onClick={() => onToggle(app)} disabled={togglingId === app.appId}
             style={{ padding: "8px 18px", borderRadius: 9, background: isActive ? T.yellow + "18" : T.green + "18", border: `1.5px solid ${isActive ? T.yellow : T.green}`, color: isActive ? T.yellow : T.green, fontWeight: 800, fontSize: 13, cursor: "pointer", whiteSpace: "nowrap" }}>
-            {togglingId === app.appId ? "…" : isActive ? "⏸ Disable" : "▶ Enable"}
+            {togglingId === app.appId ? "…" : isActive ? "Disable" : "Enable"}
           </button>
 
           {/* Delete */}
           <button onClick={() => onDelete(app)} disabled={deletingId === app.appId}
             style={{ padding: "8px 18px", borderRadius: 9, background: T.red + "18", border: `1.5px solid ${T.red}`, color: T.red, fontWeight: 800, fontSize: 13, cursor: "pointer" }}>
-            {deletingId === app.appId ? "…" : "🗑️"}
+            {deletingId === app.appId ? "…" : "Del"}
           </button>
         </div>
       </div>
@@ -607,7 +607,7 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
       }}>
         <div style={{ maxWidth: 960, margin: "0 auto", height: 56, display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 18 }}>📱</span>
+            
             <span style={{ fontWeight: 900, fontSize: 16, color: T.text }}>All Devices</span>
             <span style={{ background: T.accentGlow, color: T.accentLight, borderRadius: 99, padding: "2px 10px", fontSize: 11, fontWeight: 800, border: `1px solid ${T.accent}44` }}>
               {devices.length} total
@@ -619,7 +619,7 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
           <div style={{ display: "flex", gap: 6 }}>
             <button onClick={onRefresh} disabled={loading}
               style={{ background: T.borderLight, border: "none", color: loading ? T.muted : T.text, borderRadius: 8, padding: "7px 14px", fontSize: 12, fontWeight: 700, cursor: loading ? "default" : "pointer" }}>
-              {loading ? "⏳" : "🔄"}
+              {loading ? "..." : "Refresh"}
             </button>
             <button onClick={onClose} style={{ background: T.borderLight, border: "none", color: T.text, borderRadius: 8, padding: "7px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>✕</button>
           </div>
@@ -629,7 +629,7 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
       {/* Search */}
       <div style={{ background: T.bg, padding: "12px 16px", borderBottom: `1px solid ${T.border}`, flexShrink: 0 }}>
         <div style={{ maxWidth: 960, margin: "0 auto", position: "relative" }}>
-          <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: T.muted, fontSize: 14, pointerEvents: "none" }}>🔍</span>
+          
           <input
             type="text" placeholder="Search by name, App ID, deviceId, phone…"
             value={inputVal} onChange={e => handleSearchInput(e.target.value)} autoFocus
@@ -648,12 +648,11 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
         <div style={{ maxWidth: 960, margin: "0 auto" }}>
           {loading ? (
             <div style={{ textAlign: "center", padding: 80, color: T.muted }}>
-              <div style={{ fontSize: 32, marginBottom: 12 }}>⏳</div>
-              <div>Loading all devices…</div>
+              <div style={{ color: T.muted, fontSize: 14 }}>Loading devices…</div>
             </div>
           ) : filtered.length === 0 ? (
             <div style={{ textAlign: "center", padding: 80, color: T.muted, background: T.card, borderRadius: 14, border: `1px solid ${T.borderLight}` }}>
-              <div style={{ fontSize: 32, marginBottom: 10 }}>🔍</div>
+              
               {search ? `"${search}" se koi device nahi mila.` : "Koi device nahi hai."}
             </div>
           ) : (
@@ -961,7 +960,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
               background: "linear-gradient(135deg,#6366f1,#8b5cf6)",
               display: "flex", alignItems: "center", justifyContent: "center",
               fontSize: 16, flexShrink: 0,
-            }}>🤖</div>
+            }}></div>
             <div>
               <div style={{ fontSize: 15, fontWeight: 900, color: T.text, letterSpacing: -0.3, lineHeight: 1.1 }}>MR ROBOT</div>
               <div style={{ fontSize: 10, color: T.accent, fontWeight: 700, letterSpacing: 0.5 }}>Master Admin</div>
@@ -972,11 +971,11 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <button onClick={() => void openAllDevices()}
               style={{ padding: "7px 14px", borderRadius: 8, background: "linear-gradient(135deg,#6366f1,#8b5cf6)", border: "none", color: "#fff", fontWeight: 700, fontSize: 12, cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 2px 8px rgba(99,102,241,0.35)" }}>
-              📱 All Devices
+              All Devices
             </button>
             <button onClick={() => setShowChangePin(true)}
               style={{ padding: "7px 14px", borderRadius: 8, background: T.borderLight, border: "none", color: T.text, fontWeight: 600, fontSize: 12, cursor: "pointer", whiteSpace: "nowrap" }}>
-              🔑 PIN
+              PIN
             </button>
             <button onClick={onLogout}
               style={{ padding: "7px 14px", borderRadius: 8, background: "transparent", border: `1px solid ${T.border}`, color: T.muted, fontWeight: 600, fontSize: 12, cursor: "pointer" }}>
@@ -996,9 +995,9 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
           gap: 12, marginBottom: 24,
         }}>
           {[
-            { label: "Total Apps", val: appList.length, color: T.accent, icon: "📦" },
-            { label: "Active", val: activeCount, color: T.green, icon: "✅" },
-            { label: "Disabled", val: disabledCount, color: T.red, icon: "🚫" },
+            { label: "Total Apps", val: appList.length, color: T.accent, icon: "" },
+            { label: "Active", val: activeCount, color: T.green, icon: "" },
+            { label: "Disabled", val: disabledCount, color: T.red, icon: "" },
           ].map(({ label, val, color, icon }) => (
             <div key={label} style={{
               background: T.card, borderRadius: 12, padding: "16px 18px",
@@ -1018,7 +1017,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
         <div style={{ background: T.card, borderRadius: 14, border: `1px solid ${T.borderLight}`, overflow: "hidden", marginBottom: 20 }}>
           <div style={{ padding: "12px 18px", borderBottom: `1px solid ${T.borderLight}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontSize: 18 }}>📡</span>
+              
               <span style={{ fontWeight: 800, fontSize: 14, color: T.text }}>Update All App-IDs</span>
             </div>
             <span style={{ background: T.accentGlow, color: T.accentLight, borderRadius: 99, padding: "2px 10px", fontSize: 10, fontWeight: 800, border: `1px solid ${T.accent}44` }}>
@@ -1078,7 +1077,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
             {/* Result banners */}
             {masterUpdateState === "done" && masterUpdateResult && (
               <div style={{ background: T.green + "18", border: `1px solid ${T.green}44`, borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span style={{ color: T.green, fontWeight: 700, fontSize: 13 }}>✅ Update done!</span>
+                <span style={{ color: T.green, fontWeight: 700, fontSize: 13 }}>Update done!</span>
                 <span style={{ fontSize: 12, color: T.muted }}>
                   <span style={{ color: T.green, fontWeight: 700 }}>{masterUpdateResult.ok}</span> sent
                   {masterUpdateResult.fail > 0 && <> · <span style={{ color: T.red, fontWeight: 700 }}>{masterUpdateResult.fail}</span> failed</>}
@@ -1087,7 +1086,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
             )}
             {masterDisableState === "done" && masterDisableResult && (
               <div style={{ background: T.green + "18", border: `1px solid ${T.green}44`, borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span style={{ color: T.green, fontWeight: 700, fontSize: 13 }}>✅ Disable done!</span>
+                <span style={{ color: T.green, fontWeight: 700, fontSize: 13 }}>Disable done!</span>
                 <span style={{ fontSize: 12, color: T.muted }}>
                   <span style={{ color: T.green, fontWeight: 700 }}>{masterDisableResult.ok}</span> sent
                   {masterDisableResult.fail > 0 && <> · <span style={{ color: T.red, fontWeight: 700 }}>{masterDisableResult.fail}</span> failed</>}
@@ -1153,7 +1152,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
 
         {/* Search */}
         <div style={{ marginBottom: 14, position: "relative" }}>
-          <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", fontSize: 14, color: T.muted, pointerEvents: "none" }}>🔍</span>
+          
           <input
             type="text"
             placeholder="Search by App ID or name…"
@@ -1173,12 +1172,12 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
         {/* List */}
         {loading ? (
           <div style={{ textAlign: "center", padding: 60, color: T.muted }}>
-            <div style={{ fontSize: 28, marginBottom: 10 }}>⏳</div>
+            
             Loading apps…
           </div>
         ) : filteredApps.length === 0 ? (
           <div style={{ textAlign: "center", padding: 60, color: T.muted, background: T.card, borderRadius: 14, border: `1px solid ${T.borderLight}` }}>
-            <div style={{ fontSize: 32, marginBottom: 10 }}>{search ? "🔍" : "📭"}</div>
+            <div style={{ fontSize: 32, marginBottom: 10 }}>""</div>
             {search ? `"${search}" se koi app nahi mila.` : 'No apps yet. Click "+ New App" to create one.'}
           </div>
         ) : (
