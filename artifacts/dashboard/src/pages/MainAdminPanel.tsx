@@ -565,8 +565,9 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, on
     (d.sim2Phone ?? "").includes(s)
   ), [devices, s]);
 
-  const shown = filtered.slice(0, page * PAGE_SIZE);
-  const hasMore = shown.length < filtered.length;
+  // Search active → show ALL results; no search → paginate 48 at a time
+  const shown = s !== "" ? filtered : filtered.slice(0, page * PAGE_SIZE);
+  const hasMore = s === "" && shown.length < filtered.length;
   const online = devices.filter(d => d.status === "online").length;
 
   const appColors: Record<string, string> = {};
