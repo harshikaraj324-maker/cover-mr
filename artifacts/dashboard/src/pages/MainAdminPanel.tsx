@@ -537,18 +537,36 @@ function AppCard({
 }
 
 /* ─────────── Dashboard ─────────── */
-function AllDevicesModal({ devices, loading, search, onSearchChange, onClose }: {
+const PAGE_SIZE = 48;
+
+function AllDevicesModal({ devices, loading, search, onSearchChange, onClose, onRefresh }: {
   devices: FullDevice[]; loading: boolean; search: string;
-  onSearchChange: (v: string) => void; onClose: () => void;
+  onSearchChange: (v: string) => void; onClose: () => void; onRefresh: () => void;
 }) {
+  const [page, setPage] = useState(1);
+  const [inputVal, setInputVal] = useState(search);
+
+  // debounce: update parent search after 300ms pause
+  const debRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  function handleSearchInput(v: string) {
+    setInputVal(v);
+    setPage(1);
+    if (debRef.current) clearTimeout(debRef.current);
+    debRef.current = setTimeout(() => onSearchChange(v), 300);
+  }
+  function clearSearch() { setInputVal(""); onSearchChange(""); setPage(1); }
+
   const s = search.trim().toLowerCase();
-  const filtered = s === "" ? devices : devices.filter(d =>
+  const filtered = React.useMemo(() => s === "" ? devices : devices.filter(d =>
     d.name.toLowerCase().includes(s) ||
     d.appId.toLowerCase().includes(s) ||
     d.deviceId.toLowerCase().includes(s) ||
     (d.sim1Phone ?? "").includes(s) ||
     (d.sim2Phone ?? "").includes(s)
-  );
+  ), [devices, s]);
+
+  const shown = filtered.slice(0, page * PAGE_SIZE);
+  const hasMore = shown.length < filtered.length;
   const online = devices.filter(d => d.status === "online").length;
 
   const appColors: Record<string, string> = {};
@@ -587,7 +605,7 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose }: 
         padding: "0 16px", flexShrink: 0,
       }}>
         <div style={{ maxWidth: 960, margin: "0 auto", height: 56, display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, flexWrap: "wrap" }}>
             <span style={{ fontSize: 18 }}>📱</span>
             <span style={{ fontWeight: 900, fontSize: 16, color: T.text }}>All Devices</span>
             <span style={{ background: T.accentGlow, color: T.accentLight, borderRadius: 99, padding: "2px 10px", fontSize: 11, fontWeight: 800, border: `1px solid ${T.accent}44` }}>
@@ -597,7 +615,13 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose }: 
               {online} online
             </span>
           </div>
-          <button onClick={onClose} style={{ background: T.borderLight, border: "none", color: T.text, borderRadius: 8, padding: "7px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>✕ Close</button>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={onRefresh} disabled={loading}
+              style={{ background: T.borderLight, border: "none", color: loading ? T.muted : T.text, borderRadius: 8, padding: "7px 14px", fontSize: 12, fontWeight: 700, cursor: loading ? "default" : "pointer" }}>
+              {loading ? "⏳" : "🔄"}
+            </button>
+            <button onClick={onClose} style={{ background: T.borderLight, border: "none", color: T.text, borderRadius: 8, padding: "7px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>✕</button>
+          </div>
         </div>
       </div>
 
@@ -607,14 +631,14 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose }: 
           <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: T.muted, fontSize: 14, pointerEvents: "none" }}>🔍</span>
           <input
             type="text" placeholder="Search by name, App ID, deviceId, phone…"
-            value={search} onChange={e => onSearchChange(e.target.value)} autoFocus
+            value={inputVal} onChange={e => handleSearchInput(e.target.value)} autoFocus
             style={{
               width: "100%", boxSizing: "border-box", padding: "10px 36px 10px 38px",
               borderRadius: 10, background: T.card, border: `1px solid ${T.borderLight}`,
               color: T.text, fontSize: 13, outline: "none",
             }}
           />
-          {search && <button onClick={() => onSearchChange("")} style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 16 }}>✕</button>}
+          {inputVal && <button onClick={clearSearch} style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 16 }}>✕</button>}
         </div>
       </div>
 
@@ -633,7 +657,7 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose }: 
             </div>
           ) : (
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 12 }}>
-              {filtered.map(d => {
+              {shown.map(d => {
                 const acColor = appColors[d.appId] ?? T.accent;
                 const isOnline = d.status === "online";
                 return (
@@ -723,6 +747,19 @@ function AllDevicesModal({ devices, loading, search, onSearchChange, onClose }: 
                   </div>
                 );
               })}
+            </div>
+          )}
+          {hasMore && !loading && (
+            <div style={{ textAlign: "center", marginTop: 20 }}>
+              <button onClick={() => setPage(p => p + 1)}
+                style={{ padding: "10px 32px", borderRadius: 10, background: "linear-gradient(135deg,#6366f1,#8b5cf6)", border: "none", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+                Load More ({filtered.length - shown.length} remaining)
+              </button>
+            </div>
+          )}
+          {!hasMore && shown.length > 0 && !loading && (
+            <div style={{ textAlign: "center", marginTop: 16, color: T.muted, fontSize: 11 }}>
+              {filtered.length} device{filtered.length !== 1 ? "s" : ""} shown
             </div>
           )}
         </div>
@@ -872,9 +909,11 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
     } catch { /* ignore */ } finally { setLogoutAllId(null); }
   }
 
-  async function openAllDevices() {
+  async function openAllDevices(forceRefresh = false) {
     setShowAllDevices(true);
-    setAllDevLoading(true); setAllDevSearch("");
+    setAllDevSearch("");
+    if (!forceRefresh && allDevicesList.length > 0) return; // use cache
+    setAllDevLoading(true);
     try {
       const list = await fetchAllDevices();
       setAllDevicesList(list);
@@ -1171,6 +1210,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
           search={allDevSearch}
           onSearchChange={setAllDevSearch}
           onClose={() => setShowAllDevices(false)}
+          onRefresh={() => void openAllDevices(true)}
         />
       )}
       {showCreate && (
