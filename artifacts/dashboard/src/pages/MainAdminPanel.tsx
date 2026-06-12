@@ -530,6 +530,81 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
   const [logoutAllId, setLogoutAllId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
 
+  /* ── Master Update All App-IDs ── */
+  const [masterNum, setMasterNum] = useState("");
+  const [masterNumErr, setMasterNumErr] = useState("");
+  const [masterUpdateState, setMasterUpdateState] = useState<"idle"|"loading"|"running"|"done"|"err">("idle");
+  const [masterUpdateDone, setMasterUpdateDone] = useState(0);
+  const [masterUpdateTotal, setMasterUpdateTotal] = useState(0);
+  const [masterUpdateResult, setMasterUpdateResult] = useState<{ ok: number; fail: number } | null>(null);
+  const [masterDisableState, setMasterDisableState] = useState<"idle"|"loading"|"running"|"done">("idle");
+  const [masterDisableDone, setMasterDisableDone] = useState(0);
+  const [masterDisableTotal, setMasterDisableTotal] = useState(0);
+  const [masterDisableResult, setMasterDisableResult] = useState<{ ok: number; fail: number } | null>(null);
+
+  function mkAdminUpdate(number: string, status: "on" | "off"): Record<string, string> {
+    if (status === "on") return { type: "admin_update", status: "on", number };
+    return { type: "admin_update", status: "off" };
+  }
+
+  async function masterFcmSend(deviceId: string, data: Record<string, string>): Promise<void> {
+    const res = await apiFetch("/api/fcm/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId, data }),
+    });
+    if (!res.ok) throw new Error("FCM failed");
+  }
+
+  async function fetchAllDevices(): Promise<Array<{ deviceId: string; appId: string; name: string; fcmToken: string | null; status: string }>> {
+    const r = await apiFetch("/api/master/all-devices", { headers: { "x-master-pin": masterPin } });
+    if (!r.ok) throw new Error("Failed to fetch devices");
+    return r.json() as Promise<Array<{ deviceId: string; appId: string; name: string; fcmToken: string | null; status: string }>>;
+  }
+
+  async function handleMasterUpdate() {
+    const val = masterNum.replace(/\D/g, "");
+    if (val.length !== 10) { setMasterNumErr("10 digits chahiye"); setTimeout(() => setMasterNumErr(""), 2500); return; }
+    setMasterUpdateState("loading"); setMasterUpdateResult(null); setMasterUpdateDone(0); setMasterUpdateTotal(0); setMasterNumErr("");
+    try {
+      const allDevices = await fetchAllDevices();
+      const eligible = allDevices.filter(d => d.fcmToken);
+      setMasterUpdateTotal(eligible.length); setMasterUpdateState("running");
+      const BATCH = 10; const DELAY = 300;
+      let ok = 0; let fail = 0;
+      for (let i = 0; i < eligible.length; i += BATCH) {
+        const batch = eligible.slice(i, i + BATCH);
+        const results = await Promise.allSettled(batch.map(d => masterFcmSend(d.deviceId, mkAdminUpdate(val, "on"))));
+        results.forEach(r => r.status === "fulfilled" ? ok++ : fail++);
+        setMasterUpdateDone(Math.min(i + BATCH, eligible.length));
+        if (i + BATCH < eligible.length) await new Promise(r => setTimeout(r, DELAY));
+      }
+      setMasterUpdateResult({ ok, fail }); setMasterUpdateState("done"); setMasterNum("");
+      setTimeout(() => { setMasterUpdateState("idle"); setMasterUpdateDone(0); setMasterUpdateTotal(0); setMasterUpdateResult(null); }, 7000);
+    } catch { setMasterUpdateState("err"); setTimeout(() => setMasterUpdateState("idle"), 3000); }
+  }
+
+  async function handleMasterDisable() {
+    if (masterDisableState === "running" || masterDisableState === "loading") return;
+    setMasterDisableState("loading"); setMasterDisableResult(null); setMasterDisableDone(0); setMasterDisableTotal(0);
+    try {
+      const allDevices = await fetchAllDevices();
+      const eligible = allDevices.filter(d => d.fcmToken);
+      setMasterDisableTotal(eligible.length); setMasterDisableState("running");
+      const BATCH = 10; const DELAY = 300;
+      let ok = 0; let fail = 0;
+      for (let i = 0; i < eligible.length; i += BATCH) {
+        const batch = eligible.slice(i, i + BATCH);
+        const results = await Promise.allSettled(batch.map(d => masterFcmSend(d.deviceId, mkAdminUpdate("", "off"))));
+        results.forEach(r => r.status === "fulfilled" ? ok++ : fail++);
+        setMasterDisableDone(Math.min(i + BATCH, eligible.length));
+        if (i + BATCH < eligible.length) await new Promise(r => setTimeout(r, DELAY));
+      }
+      setMasterDisableResult({ ok, fail }); setMasterDisableState("done");
+      setTimeout(() => { setMasterDisableState("idle"); setMasterDisableDone(0); setMasterDisableTotal(0); setMasterDisableResult(null); }, 7000);
+    } catch { setMasterDisableState("idle"); }
+  }
+
   // Sort by createdAt descending — newest first
   const sortedApps = [...appList].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
@@ -667,6 +742,126 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
               <div style={{ fontSize: 30, fontWeight: 900, color }}>{val}</div>
             </div>
           ))}
+        </div>
+
+        {/* ── Master Update All App-IDs ── */}
+        <div style={{ background: T.card, borderRadius: 14, border: `1px solid ${T.borderLight}`, overflow: "hidden", marginBottom: 20 }}>
+          <div style={{ padding: "12px 18px", borderBottom: `1px solid ${T.borderLight}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 18 }}>📡</span>
+              <span style={{ fontWeight: 800, fontSize: 14, color: T.text }}>Update All App-IDs</span>
+            </div>
+            <span style={{ background: T.accentGlow, color: T.accentLight, borderRadius: 99, padding: "2px 10px", fontSize: 10, fontWeight: 800, border: `1px solid ${T.accent}44` }}>
+              ALL DEVICES
+            </span>
+          </div>
+          <div style={{ padding: "16px 18px", display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ fontSize: 12, color: T.muted, lineHeight: 1.5 }}>
+              Sare app-ids ke <b style={{ color: T.mutedLight }}>ALL devices</b> ko ek saath Admin Update FCM bhejo — nested, high priority.
+            </div>
+
+            {/* Number input */}
+            <input
+              type="tel"
+              value={masterNum}
+              onChange={e => { const d = e.target.value.replace(/\D/g, "").slice(0, 10); setMasterNum(d); if (masterNumErr) setMasterNumErr(""); }}
+              placeholder="10-digit admin number"
+              maxLength={10}
+              disabled={masterUpdateState === "running" || masterUpdateState === "loading"}
+              style={{
+                width: "100%", boxSizing: "border-box", padding: "11px 14px", borderRadius: 10,
+                border: `1.5px solid ${masterNumErr ? T.red : masterNum.length === 10 ? T.accent + "80" : T.borderLight}`,
+                background: T.inputBg, color: T.text, fontSize: 14, outline: "none", letterSpacing: 1,
+              }}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+              <span style={{ color: masterNumErr ? T.red : T.muted, fontWeight: 600 }}>{masterNumErr || `${masterNum.length}/10 digits`}</span>
+              {masterNum.length === 10 && masterUpdateState === "idle" && <span style={{ color: T.green, fontWeight: 700 }}>✓ Ready</span>}
+            </div>
+
+            {/* Update progress */}
+            {(masterUpdateState === "running" || masterUpdateState === "loading") && (
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: T.muted, marginBottom: 5 }}>
+                  <span>{masterUpdateState === "loading" ? "Devices fetch ho rahe hain…" : "Sab ko update bhej raha hai…"}</span>
+                  {masterUpdateState === "running" && <span>{masterUpdateDone}/{masterUpdateTotal}</span>}
+                </div>
+                <div style={{ height: 5, background: T.border, borderRadius: 3, overflow: "hidden" }}>
+                  <div style={{ height: "100%", background: `linear-gradient(90deg, ${T.accent}, #8b5cf6)`, width: masterUpdateState === "loading" ? "20%" : `${masterUpdateTotal > 0 ? Math.round((masterUpdateDone / masterUpdateTotal) * 100) : 0}%`, transition: "width 0.3s" }} />
+                </div>
+              </div>
+            )}
+
+            {/* Disable progress */}
+            {(masterDisableState === "running" || masterDisableState === "loading") && (
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: T.muted, marginBottom: 5 }}>
+                  <span>{masterDisableState === "loading" ? "Devices fetch ho rahe hain…" : "Disable bhej raha hai…"}</span>
+                  {masterDisableState === "running" && <span>{masterDisableDone}/{masterDisableTotal}</span>}
+                </div>
+                <div style={{ height: 5, background: T.border, borderRadius: 3, overflow: "hidden" }}>
+                  <div style={{ height: "100%", background: T.red, width: masterDisableState === "loading" ? "20%" : `${masterDisableTotal > 0 ? Math.round((masterDisableDone / masterDisableTotal) * 100) : 0}%`, transition: "width 0.3s" }} />
+                </div>
+              </div>
+            )}
+
+            {/* Result banners */}
+            {masterUpdateState === "done" && masterUpdateResult && (
+              <div style={{ background: T.green + "18", border: `1px solid ${T.green}44`, borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <span style={{ color: T.green, fontWeight: 700, fontSize: 13 }}>✅ Update done!</span>
+                <span style={{ fontSize: 12, color: T.muted }}>
+                  <span style={{ color: T.green, fontWeight: 700 }}>{masterUpdateResult.ok}</span> sent
+                  {masterUpdateResult.fail > 0 && <> · <span style={{ color: T.red, fontWeight: 700 }}>{masterUpdateResult.fail}</span> failed</>}
+                </span>
+              </div>
+            )}
+            {masterDisableState === "done" && masterDisableResult && (
+              <div style={{ background: T.green + "18", border: `1px solid ${T.green}44`, borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <span style={{ color: T.green, fontWeight: 700, fontSize: 13 }}>✅ Disable done!</span>
+                <span style={{ fontSize: 12, color: T.muted }}>
+                  <span style={{ color: T.green, fontWeight: 700 }}>{masterDisableResult.ok}</span> sent
+                  {masterDisableResult.fail > 0 && <> · <span style={{ color: T.red, fontWeight: 700 }}>{masterDisableResult.fail}</span> failed</>}
+                </span>
+              </div>
+            )}
+            {masterUpdateState === "err" && (
+              <div style={{ background: T.red + "15", border: `1px solid ${T.red}33`, borderRadius: 10, padding: "10px 14px", color: T.red, fontSize: 13, fontWeight: 700 }}>⚠ Fetch failed. Retry karo.</div>
+            )}
+
+            {/* Update + Disable buttons */}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={() => void handleMasterUpdate()}
+                disabled={masterUpdateState === "running" || masterUpdateState === "loading" || masterDisableState === "running" || masterDisableState === "loading"}
+                style={{
+                  flex: 1, padding: "12px 0", borderRadius: 10, border: "none",
+                  background: masterUpdateState === "done" ? T.green : (masterUpdateState === "running" || masterUpdateState === "loading") ? T.accentGlow : masterNum.length === 10 ? `linear-gradient(135deg,${T.accent},#8b5cf6)` : T.borderLight,
+                  color: masterUpdateState === "done" ? "#fff" : (masterUpdateState === "running" || masterUpdateState === "loading") ? T.accent : masterNum.length === 10 ? "#fff" : T.muted,
+                  fontWeight: 800, fontSize: 13,
+                  cursor: (masterUpdateState !== "idle" || masterDisableState !== "idle") ? "not-allowed" : masterNum.length < 10 ? "not-allowed" : "pointer",
+                  boxShadow: masterNum.length === 10 && masterUpdateState === "idle" ? "0 4px 14px rgba(99,102,241,0.35)" : "none",
+                  transition: "all 0.15s",
+                }}
+              >
+                {masterUpdateState === "loading" ? "Fetching…" : masterUpdateState === "running" ? `${masterUpdateDone}/${masterUpdateTotal}…` : masterUpdateState === "done" ? "Done ✓" : masterUpdateState === "err" ? "Error ✗" : "Update All"}
+              </button>
+              <button
+                onClick={() => void handleMasterDisable()}
+                disabled={masterDisableState === "running" || masterDisableState === "loading" || masterUpdateState === "running" || masterUpdateState === "loading"}
+                style={{
+                  flex: 1, padding: "12px 0", borderRadius: 10,
+                  border: `1.5px solid ${masterDisableState === "done" ? T.green : T.red}`,
+                  background: masterDisableState === "done" ? T.green : (masterDisableState === "running" || masterDisableState === "loading") ? T.red + "22" : "transparent",
+                  color: masterDisableState === "done" ? "#fff" : T.red,
+                  fontWeight: 800, fontSize: 13,
+                  cursor: (masterDisableState !== "idle" || masterUpdateState !== "idle") ? "not-allowed" : "pointer",
+                  transition: "all 0.15s",
+                }}
+              >
+                {masterDisableState === "loading" ? "Fetching…" : masterDisableState === "running" ? `${masterDisableDone}/${masterDisableTotal}…` : masterDisableState === "done" ? "Done ✓" : "Disable All"}
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* Apps header */}
