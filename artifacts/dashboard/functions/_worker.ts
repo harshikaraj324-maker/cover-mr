@@ -981,6 +981,22 @@ app.delete("/api/master/apps/:appId", async (c) => {
   return c.json({ ok: true });
 });
 
+// Master admin: get ALL devices across all app-ids — x-master-pin required
+app.get("/api/master/all-devices", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const db = getDb(c.env);
+  const rows = await db.select({
+    id: devices.id,
+    deviceId: devices.deviceId,
+    appId: devices.appId,
+    name: devices.name,
+    fcmToken: devices.fcmToken,
+    status: devices.status,
+  }).from(devices).orderBy(asc(devices.appId));
+  return c.json(rows);
+});
+
 // ------- ADMIN SESSIONS (Postgres-backed) -------
 app.get("/api/admin/sessions", async (c) => {
   const sqlClient = neon(c.env.NEON_DATABASE_URL);
