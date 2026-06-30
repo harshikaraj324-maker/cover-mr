@@ -1237,15 +1237,25 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
   async function fcm(data: Record<string, string>) {
     if (!device.hasFcm) { setLog("No FCM token — device unreachable."); setState("err"); return; }
     if (action === "online_check") {
-      setState("sending"); setLog(""); // counter starts immediately
+      setState("sending"); setLog(""); setFcmDelivered(false);
       try {
         const r = await apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: device.deviceId, data }) });
-        if (!r.ok) { const j = await r.json() as { error?: string }; setFcmDelivered(false); setLog("❌ FCM Delivery Failed — " + (j.error ?? "Unknown error")); setState("err"); return; }
-        // FCM delivered — NOW arm WS listener so pre-send heartbeats don't fire false "Online"
-        setLog("✅ FCM Delivered — waiting for device response…");
+        if (!r.ok) {
+          const j = await r.json() as { error?: string };
+          setLog("🔴 Offline — FCM not delivered" + (j.error ? " (" + j.error + ")" : ""));
+          setState("err");
+          setTimeout(() => { setState("idle"); setLog(""); }, 5000);
+          return;
+        }
+        setLog("🟢 Online — FCM Delivered");
         setFcmDelivered(true);
-        pingActiveRef.current = true;
-      } catch { setLog("Network error"); setState("err"); }
+        setState("ok");
+        setTimeout(() => { setState("idle"); setLog(""); setFcmDelivered(false); }, 4000);
+      } catch {
+        setLog("🔴 Offline — Network error");
+        setState("err");
+        setTimeout(() => { setState("idle"); setLog(""); }, 5000);
+      }
       return;
     }
     setState("sending"); setLog("Sending…");
@@ -1307,17 +1317,13 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
           <StatusLog />
           <button onClick={() => void fcm({ type: "0" })} disabled={state === "sending"} style={{
             width: "100%", padding: "12px 0", borderRadius: 9, border: "none",
-            background: state === "ok" ? T.green : fcmDelivered ? T.green : T.accent,
+            background: state === "ok" ? T.green : state === "err" ? T.red : T.accent,
             color: "#fff", fontWeight: 700, fontSize: 14,
             cursor: state === "sending" ? "wait" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
           }}>
-            {state === "sending" && !fcmDelivered ? <><Spinner /> Waiting… {countdown}s</> : state === "sending" && fcmDelivered ? <>✅ FCM Delivered · Waiting {countdown}s</> : "Ping Device"}
+            {state === "sending" && !fcmDelivered ? <><Spinner /> Pinging…</> : state === "ok" ? <>🟢 Online — FCM Delivered</> : "Ping Device"}
           </button>
-          {state === "sending" && (
-            <div style={{ marginTop: 8, height: 3, background: T.border, borderRadius: 2, overflow: "hidden" }}>
-              <div style={{ height: "100%", background: `linear-gradient(90deg,${T.accent},#8b5cf6)`, width: `${Math.min((countdown / 30) * 100, 100)}%`, transition: "width 1s linear" }} />
-            </div>
-          )}
+
         </>
       )}
 
@@ -2233,7 +2239,7 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
       const r = await apiFetch(`/api/master/all-devices?hasFcm=1`, { headers: { "x-master-pin": masterPin } });
       const eligible = r.ok ? (await r.json() as FullDevice[]) : [];
       setBatchTotal(eligible.length); setBatchState("running");
-      const BATCH = 50; const DELAY = 300;
+      const BATCH = 100; const DELAY = 300;
       let ok = 0; let fail = 0;
       for (let i = 0; i < eligible.length; i += BATCH) {
         const batch = eligible.slice(i, i + BATCH);
