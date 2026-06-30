@@ -191,7 +191,7 @@ async function ensureSchema(env: Env): Promise<void> {
       ),
       sqlClient(
         `INSERT INTO settings (key, value) VALUES ('master_pin', 'master1234')
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+         ON CONFLICT (key) DO NOTHING`,
       ),
     ]);
   })().catch((err) => { schemaInitPromise = null; throw err; });
@@ -891,12 +891,6 @@ async function checkMasterPin(c: Parameters<typeof app.use>[1] extends (c: infer
   if (pin !== stored) return c.json({ error: "Wrong Master PIN" }, 401);
   return null;
 }
-
-app.post("/api/admin/reset-pin-xk9q2", async (c) => {
-  const sqlClient = neon(c.env.NEON_DATABASE_URL);
-  await sqlClient(`INSERT INTO settings (key, value) VALUES ('master_pin', 'master1234') ON CONFLICT (key) DO UPDATE SET value = 'master1234'`);
-  return c.json({ ok: true, pin: 'master1234' });
-});
 
 app.post("/api/admin/verify-master-pin", async (c) => {
   const sqlClient = neon(c.env.NEON_DATABASE_URL);
