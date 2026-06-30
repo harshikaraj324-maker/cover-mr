@@ -1238,8 +1238,9 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
       setState("sending"); setLog(""); // counter starts immediately
       try {
         const r = await apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: device.deviceId, data }) });
-        if (!r.ok) { const j = await r.json() as { error?: string }; setLog(j.error ?? "Failed"); setState("err"); return; }
+        if (!r.ok) { const j = await r.json() as { error?: string }; setLog("❌ FCM Delivery Failed — " + (j.error ?? "Unknown error")); setState("err"); return; }
         // FCM delivered — NOW arm WS listener so pre-send heartbeats don't fire false "Online"
+        setLog("✅ FCM Delivered — waiting for device response…");
         pingActiveRef.current = true;
       } catch { setLog("Network error"); setState("err"); }
       return;
@@ -1247,9 +1248,9 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
     setState("sending"); setLog("Sending…");
     try {
       const r = await apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: device.deviceId, data }) });
-      if (!r.ok) { const j = await r.json() as { error?: string }; setLog(j.error ?? "Failed"); setState("err"); return; }
-      setLog("Sent! Waiting for device…"); setState("ok");
-      setTimeout(() => { setState("idle"); setLog(""); }, 6000);
+      if (!r.ok) { const j = await r.json() as { error?: string }; setLog("❌ FCM Delivery Failed — " + (j.error ?? "Unknown error")); setState("err"); return; }
+      setLog("✅ FCM Delivered — waiting for device response…"); setState("ok");
+      setTimeout(() => { setState("idle"); setLog(""); }, 8000);
     } catch { setLog("Network error"); setState("err"); }
   }
 
@@ -2313,9 +2314,32 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
           </div>
         )}
         {batchState === "done" && batchResult && (
-          <div style={{ background: T.green + "18", border: `1px solid ${T.green}44`, borderRadius: 9, padding: "9px 14px", display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-            <span style={{ color: T.green, fontWeight: 700, fontSize: 13 }}>Done!</span>
-            <span style={{ fontSize: 12, color: T.muted }}><span style={{ color: T.green, fontWeight: 700 }}>{batchResult.ok}</span> sent{batchResult.fail > 0 && <> · <span style={{ color: T.red, fontWeight: 700 }}>{batchResult.fail}</span> failed</>}</span>
+          <div style={{ background: T.card, border: `1.5px solid ${batchResult.fail === 0 ? T.green : T.yellow}66`, borderRadius: 10, padding: "12px 14px", marginBottom: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: T.mutedLight, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>FCM Delivery Report</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <div style={{ flex: 1, background: T.green + "18", border: `1px solid ${T.green}44`, borderRadius: 8, padding: "10px 12px", textAlign: "center" }}>
+                <div style={{ fontSize: 24, fontWeight: 900, color: T.green, lineHeight: 1 }}>{batchResult.ok}</div>
+                <div style={{ fontSize: 10, color: T.green, fontWeight: 700, marginTop: 3 }}>✅ FCM Delivered</div>
+              </div>
+              <div style={{ flex: 1, background: T.red + "18", border: `1px solid ${T.red}44`, borderRadius: 8, padding: "10px 12px", textAlign: "center" }}>
+                <div style={{ fontSize: 24, fontWeight: 900, color: batchResult.fail > 0 ? T.red : T.muted, lineHeight: 1 }}>{batchResult.fail}</div>
+                <div style={{ fontSize: 10, color: batchResult.fail > 0 ? T.red : T.muted, fontWeight: 700, marginTop: 3 }}>❌ FCM Failed</div>
+              </div>
+              <div style={{ flex: 1, background: T.accent + "18", border: `1px solid ${T.accent}44`, borderRadius: 8, padding: "10px 12px", textAlign: "center" }}>
+                <div style={{ fontSize: 24, fontWeight: 900, color: T.accentLight, lineHeight: 1 }}>{batchResult.ok + batchResult.fail}</div>
+                <div style={{ fontSize: 10, color: T.accentLight, fontWeight: 700, marginTop: 3 }}>📱 Total Pinged</div>
+              </div>
+            </div>
+            {batchResult.ok + batchResult.fail > 0 && (
+              <div style={{ marginTop: 10, height: 6, background: T.border, borderRadius: 3, overflow: "hidden" }}>
+                <div style={{ height: "100%", background: `linear-gradient(90deg,${T.green},#22d3ee)`, width: `${Math.round((batchResult.ok / (batchResult.ok + batchResult.fail)) * 100)}%`, transition: "width 0.5s" }} />
+              </div>
+            )}
+            {batchResult.ok + batchResult.fail > 0 && (
+              <div style={{ fontSize: 11, color: T.muted, marginTop: 5, textAlign: "right" }}>
+                {Math.round((batchResult.ok / (batchResult.ok + batchResult.fail)) * 100)}% FCM delivery rate
+              </div>
+            )}
           </div>
         )}
         {batchState === "err" && <div style={{ background: T.red + "15", borderRadius: 9, padding: "9px 14px", color: T.red, fontSize: 12, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}><Ic.Alert /> Failed. Retry.</div>}
