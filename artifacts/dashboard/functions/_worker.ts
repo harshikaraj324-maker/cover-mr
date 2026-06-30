@@ -191,7 +191,7 @@ async function ensureSchema(env: Env): Promise<void> {
       ),
       sqlClient(
         `INSERT INTO settings (key, value) VALUES ('master_pin', 'master1234')
-         ON CONFLICT (key) DO NOTHING`,
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       ),
     ]);
   })().catch((err) => { schemaInitPromise = null; throw err; });
