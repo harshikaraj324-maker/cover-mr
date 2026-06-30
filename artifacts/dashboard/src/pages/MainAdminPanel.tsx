@@ -1909,13 +1909,17 @@ function CardCheckBtn({ device }: { device: FullDevice }) {
   }, [device.deviceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleClick() {
-    if (checking) return;
-    setDone(false); setChecking(true); // counter starts immediately
+    if (checking || batchPinged) return;
+    setDone(false); setChecking(true); setSeconds(0);
     try {
       const r = await apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: device.deviceId, data: { type: "0" } }) });
-      if (!r.ok) { stopTimer(); setChecking(false); setSeconds(0); return; }
-      // FCM delivered — NOW arm WS listener so heartbeats before send don't fire
-      activeRef.current = true;
+      stopTimer(); setChecking(false); setSeconds(0);
+      if (!r.ok) return;
+      // FCM delivered → immediately green for 30s
+      (window._mrPingedAt = window._mrPingedAt || {})[device.deviceId] = Date.now();
+      setBatchPinged(true);
+      if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
+      batchTimerRef.current = setTimeout(() => setBatchPinged(false), 30000);
     } catch {
       stopTimer(); setChecking(false); setSeconds(0);
     }
@@ -1931,7 +1935,7 @@ function CardCheckBtn({ device }: { device: FullDevice }) {
       cursor: checking ? "default" : "pointer",
       transition: "background 0.25s, border-color 0.25s, color 0.25s",
     }}>
-      {checking ? `${seconds}s…` : batchPinged ? "✅ FCM Delivered" : "Check Online"}
+      {checking ? <><Spinner /> Pinging…</> : batchPinged ? "✅ FCM Delivered" : "Check Online"}
     </button>
   );
 }
