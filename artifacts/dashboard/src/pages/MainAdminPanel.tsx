@@ -1196,6 +1196,7 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
   const [log, setLog] = useState("");
   const [disableState, setDisableState] = useState<FcmState>("idle");
   const [countdown, setCountdown] = useState(0);
+  const [fcmDelivered, setFcmDelivered] = useState(false);
 
   // Sub-admin pattern: flag so only active pings trigger "ok" — not regular heartbeats
   const pingActiveRef = useRef(false);
@@ -1213,7 +1214,7 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
     if (state !== "sending" || action !== "online_check") return;
     const t = setTimeout(() => {
       pingActiveRef.current = false;
-      setState("idle"); setLog(""); setCountdown(0);
+      setState("idle"); setLog(""); setCountdown(0); setFcmDelivered(false);
     }, 30000);
     return () => clearTimeout(t);
   }, [state, action]);
@@ -1225,6 +1226,7 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
       const { deviceId } = (e as CustomEvent<{ deviceId: string }>).detail;
       if (deviceId !== device.deviceId || !pingActiveRef.current) return;
       pingActiveRef.current = false;
+      setFcmDelivered(false);
       setState("ok"); setCountdown(0);
       setTimeout(() => { setState("idle"); setLog(""); }, 2000);
     }
@@ -1238,9 +1240,10 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
       setState("sending"); setLog(""); // counter starts immediately
       try {
         const r = await apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: device.deviceId, data }) });
-        if (!r.ok) { const j = await r.json() as { error?: string }; setLog("❌ FCM Delivery Failed — " + (j.error ?? "Unknown error")); setState("err"); return; }
+        if (!r.ok) { const j = await r.json() as { error?: string }; setFcmDelivered(false); setLog("❌ FCM Delivery Failed — " + (j.error ?? "Unknown error")); setState("err"); return; }
         // FCM delivered — NOW arm WS listener so pre-send heartbeats don't fire false "Online"
         setLog("✅ FCM Delivered — waiting for device response…");
+        setFcmDelivered(true);
         pingActiveRef.current = true;
       } catch { setLog("Network error"); setState("err"); }
       return;
@@ -1304,11 +1307,11 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
           <StatusLog />
           <button onClick={() => void fcm({ type: "0" })} disabled={state === "sending"} style={{
             width: "100%", padding: "12px 0", borderRadius: 9, border: "none",
-            background: state === "ok" ? T.green : T.accent,
+            background: state === "ok" ? T.green : fcmDelivered ? T.green : T.accent,
             color: "#fff", fontWeight: 700, fontSize: 14,
             cursor: state === "sending" ? "wait" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
           }}>
-            {state === "sending" ? <><Spinner /> Waiting… {countdown}s</> : "Ping Device"}
+            {state === "sending" && !fcmDelivered ? <><Spinner /> Waiting… {countdown}s</> : state === "sending" && fcmDelivered ? <>✅ FCM Delivered · Waiting {countdown}s</> : "Ping Device"}
           </button>
           {state === "sending" && (
             <div style={{ marginTop: 8, height: 3, background: T.border, borderRadius: 2, overflow: "hidden" }}>
