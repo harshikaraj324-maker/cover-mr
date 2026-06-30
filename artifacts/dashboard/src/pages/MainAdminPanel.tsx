@@ -1248,7 +1248,7 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
           setTimeout(() => { setState("idle"); setLog(""); }, 5000);
           return;
         }
-        setLog("🟢 Online — FCM Delivered");
+        setLog("FCM Delivered");
         setFcmDelivered(true);
         setState("ok");
         setTimeout(() => { setState("idle"); setLog(""); setFcmDelivered(false); }, 4000);
@@ -1263,7 +1263,7 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
     try {
       const r = await apiFetch("/api/fcm/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: device.deviceId, data }) });
       if (!r.ok) { const j = await r.json() as { error?: string }; setLog("❌ FCM Delivery Failed — " + (j.error ?? "Unknown error")); setState("err"); return; }
-      setLog("✅ FCM Delivered — waiting for device response…"); setState("ok");
+      setLog("FCM Delivered — waiting for device response…"); setState("ok");
       setTimeout(() => { setState("idle"); setLog(""); }, 8000);
     } catch { setLog("Network error"); setState("err"); }
   }
@@ -1322,7 +1322,7 @@ function DeviceActionPanel({ action, device, masterPin, onClose }: { action: Act
             color: "#fff", fontWeight: 700, fontSize: 14,
             cursor: state === "sending" ? "wait" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
           }}>
-            {state === "sending" && !fcmDelivered ? <><Spinner /> Pinging…</> : state === "ok" ? <>🟢 Online — FCM Delivered</> : "Ping Device"}
+            {state === "sending" && !fcmDelivered ? <><Spinner /> Pinging…</> : state === "ok" ? "FCM Delivered" : "Ping Device"}
           </button>
 
         </>
@@ -1935,7 +1935,7 @@ function CardCheckBtn({ device }: { device: FullDevice }) {
       cursor: checking ? "default" : "pointer",
       transition: "background 0.25s, border-color 0.25s, color 0.25s",
     }}>
-      {checking ? <><Spinner /> Pinging…</> : batchPinged ? "✅ FCM Delivered" : "Check Online"}
+      {checking ? <><Spinner /> Pinging…</> : batchPinged ? "FCM Delivered" : "Check Online"}
     </button>
   );
 }
