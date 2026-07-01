@@ -518,7 +518,7 @@ const app = new Hono<{ Bindings: Env; Variables: { sessionAppId: string } }>();
 app.use("*", cors({
   origin: "*",
   allowMethods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-  allowHeaders: ["Content-Type", "Authorization", "x-master-pin", "x-api-key"],
+  allowHeaders: ["Content-Type", "Authorization", "x-master-pin", "x-api-key", "x-session-token", "x-silent"],
 }));
 
 app.use("*", async (c, next) => {
@@ -540,6 +540,10 @@ app.use("*", async (c, next) => {
   }
   // Delete-protection read is safe without x-api-key (no sensitive data exposed)
   if (method === "GET" && path.includes("/delete-protection")) {
+    return await next();
+  }
+  // App info (name, status) is public — needed before PIN login to show app name
+  if (method === "GET" && /^\/api\/apps\/[^/]+$/.test(path)) {
     return await next();
   }
   // Master SSE — EventSource can't send headers, so use short-lived HMAC-signed ?token=
@@ -2652,4 +2656,5 @@ export default {
     return env.ASSETS.fetch(request);
   },
 };
+
 
