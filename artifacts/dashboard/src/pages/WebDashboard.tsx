@@ -8,6 +8,12 @@ const _API_KEY = import.meta.env.VITE_API_SECRET ?? "";
 function apiFetch(url: string, opts: RequestInit = {}): Promise<Response> {
   const h = new Headers(opts.headers);
   if (_API_KEY) h.set("x-api-key", _API_KEY);
+  // Auto-attach session token so all authenticated requests work
+  const _aidForSession = new URLSearchParams(window.location.search).get("appId") || "";
+  if (_aidForSession) {
+    const _sid = localStorage.getItem(`mrrobot_session_id_${_aidForSession}`);
+    if (_sid) h.set("x-session-token", _sid);
+  }
   return fetch(url, { ...opts, headers: h });
 }
 
@@ -2458,7 +2464,7 @@ function LoginPage({ onAuth, appId, appName }: { onAuth: () => void; appId: stri
         );
         setPin(""); return;
       }
-      const sessR = await apiFetch("/api/admin/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ appId }) }).catch(() => null);
+      const sessR = await apiFetch("/api/admin/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ appId, pin }) }).catch(() => null);
       if (sessR?.ok) {
         const { sessionId } = await sessR.json();
         localStorage.setItem(`mrrobot_session_id_${appId}`, sessionId);
@@ -2662,11 +2668,7 @@ export default function WebDashboard() {
     async function pingSession() {
       const sid = localStorage.getItem(`mrrobot_session_id_${appId}`);
       if (!sid) {
-          // Already logged in but no session tracked — create one (handles old-code logins)
-          apiFetch("/api/admin/sessions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ appId }) })
-            .then(r => r.ok ? r.json() : null)
-            .then(data => { if (data?.sessionId) localStorage.setItem(`mrrobot_session_id_${appId}`, data.sessionId); })
-            .catch(() => {});
+          // No session stored — skip ping; user must re-login if session was lost
           return;
         }
       try {
@@ -3218,5 +3220,6 @@ export default function WebDashboard() {
     </ThemeCtx.Provider>
   );
 }
+
 
 
