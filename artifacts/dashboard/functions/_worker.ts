@@ -546,6 +546,10 @@ app.use("*", async (c, next) => {
   if (method === "GET" && /^\/api\/apps\/[^/]+$/.test(path)) {
     return await next();
   }
+  // Init data — route handler does its own appId + session/pin check
+  if (method === "GET" && path === "/api/init") {
+    return await next();
+  }
   // Master SSE — EventSource can't send headers, so use short-lived HMAC-signed ?token=
   // Token issued by POST /api/master/sse-token after verifying master PIN — PIN never in URL
   if ((method === "GET" || method === "HEAD") && path === "/api/master/events") {
@@ -657,9 +661,15 @@ app.get("/api/init", async (c) => {
   const rawLimit = limitParam == null ? 2000 : Math.max(0, Math.min(5000, parseInt(limitParam, 10) || 2000));
   if (!appId) return c.json({ error: "appId is required" }, 400);
   const isMaster = (c.req.header("x-master-pin") ?? "") === await getMasterPin(c.env);
-  // Require valid session or master PIN
-  if (!isMaster) {
-    if (c.get('sessionAppId') !== appId) return c.json({ error: "Unauthorized" }, 401);
+  const sessionAppId = c.get('sessionAppId');
+  // Accept: master PIN, or valid session for this app, or any request with the correct appId (appId is the access key for web clients)
+  if (!isMaster && sessionAppId && sessionAppId !== appId) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  // If no session at all, validate app exists and is active
+  if (!isMaster && !sessionAppId) {
+    const [appRow] = await db.select({ status: apps.status }).from(apps).where(eq(apps.appId, appId)).limit(1);
+    if (!appRow || appRow.status !== "active") return c.json({ error: "Unauthorized" }, 401);
   }
   const msgWhere = isMaster
     ? eq(messages.appId, appId)
